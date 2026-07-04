@@ -17,7 +17,7 @@ __all__ = ['NWS_ALERTS_URL', 'NWS_UA', '_IPAWS_EAS_BASE', '_IPAWS_FEED_PATHS', '
 
 NWS_ALERTS_URL  = "https://api.weather.gov/alerts/active"
 
-NWS_UA          = "EmergencyAlertarr/0.2 (github.com/jstevenscl/emergencyalertarr)"
+NWS_UA          = "EmergencyAlertarr/0.4 (https://github.com/sds8910-nash/EmergencyAlertArr)"
 
 def _fetch_nws_alerts(zones, severity_threshold="Moderate"):
     # Special sentinel: "ALL" means nationwide -- query every active US alert
