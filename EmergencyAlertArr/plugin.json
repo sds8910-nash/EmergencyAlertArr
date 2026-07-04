@@ -55,6 +55,10 @@
       "label": "View Active Alerts"
     },
     {
+      "id": "fetch_alerts",
+      "label": "Fetch Alerts Now"
+    },
+    {
       "id": "view_history",
       "label": "View Alert History"
     },
