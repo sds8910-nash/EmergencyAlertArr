@@ -1,0 +1,101 @@
+{
+  "name": "EmergencyAlertarr",
+  "version": "0.4.00",
+  "logo": "logo.png",
+  "description": "Emergency Alert System overlays (NWS + FEMA IPAWS) for IPTV channels",
+  "author": "sds8910",
+  "actions": [
+    {
+      "id": "_header_eas",
+      "type": "info",
+      "label": "-- Emergency Alert System --"
+    },
+    {
+      "id": "enable_eas",
+      "label": "Enable EAS",
+      "confirm": {
+        "message": "This will arm the selected channel(s) for EAS monitoring. The channel returns to passthrough under normal conditions and switches to the full EAS overlay automatically when an NWS or IPAWS alert fires for your configured area. Continue?"
+      }
+    },
+    {
+      "id": "disable_eas",
+      "label": "Disable EAS",
+      "confirm": {
+        "message": "This will restore the original stream profile and remove EAS monitoring for the selected channel(s). Continue?"
+      }
+    },
+    {
+      "id": "test_eas",
+      "label": "Test EAS Alert",
+      "confirm": {
+        "message": "This will fire a test EAS alert on the selected channel(s) \u2014 header tones, attention tones, silence, then EOM tones \u2014 then auto-restore. Use this to verify your tones and overlay look correct. Continue?"
+      }
+    },
+    {
+      "id": "inject_alert",
+      "label": "Inject Custom Alert",
+      "confirm": {
+        "message": "This will broadcast the custom alert defined in the Custom Alert Injection settings on the selected EAS channel(s), with the full overlay, tones, and (if enabled) spoken readout. Continue?"
+      }
+    },
+    {
+      "id": "migrate_eas",
+      "label": "Migrate EAS to Dynamic Mode",
+      "confirm": {
+        "message": "This restores all EAS channels to their original passthrough profiles and removes any old always-on re-encode profiles. Channels will automatically switch to the EAS overlay only when a real alert fires. Continue?"
+      }
+    },
+    {
+      "id": "_header_manage",
+      "type": "info",
+      "label": "-- Manage --"
+    },
+    {
+      "id": "view_active",
+      "label": "View Active Alerts"
+    },
+    {
+      "id": "view_history",
+      "label": "View Alert History"
+    },
+    {
+      "id": "clear_history",
+      "label": "Clear Alert History",
+      "confirm": {
+        "message": "This will permanently erase the recorded EAS alert history. Continue?"
+      }
+    },
+    {
+      "id": "clean_orphans",
+      "label": "Clean Orphaned Profiles",
+      "confirm": {
+        "message": "This will delete all EmergencyAlertarr-cloned stream profiles that have no active channel mapping. Continue?"
+      }
+    },
+    {
+      "id": "reset_all_eas",
+      "label": "Reset All EAS (Wipe Mappings)",
+      "confirm": {
+        "message": "This will UNARM every channel, restore all original profiles, delete all EmergencyAlertarr cloned profiles, and erase all EAS mappings for a full clean slate. Use this if old armings persisted after reinstalling. Continue?"
+      }
+    },
+    {
+      "id": "redis_diag",
+      "label": "Redis Diagnostics"
+    },
+    {
+      "id": "reload_poller",
+      "label": "Reload Poller",
+      "confirm": {
+        "message": "This will restart the background polling thread. EAS monitoring will resume within 15 seconds. Continue?"
+      }
+    },
+    {
+      "id": "restart_dispatcharr",
+      "label": "Restart Dispatcharr",
+      "confirm": {
+        "message": "This will send a graceful restart signal to Dispatcharr. The page will go offline briefly \u2014 refresh in about 15 seconds. Continue?"
+      }
+    }
+  ]
+}
