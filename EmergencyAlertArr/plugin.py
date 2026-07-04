@@ -591,10 +591,12 @@ def _inject_eas_wav_sequence(params, mid_path=None, mid_secs=15, endec_test=Fals
         audio_graph = (
             f"[{wi_h}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[h];"
             f"[{wi_e}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[e];"
+            f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration=1.0,"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[gap];"
             f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={tail_secs},"
             f"aformat=sample_fmts=fltp:channel_layouts=stereo[tail];"
             f"{_lead_clause}"
-            f"{_lead_lbl}[h][e][tail]concat=n={3 + _lead_n}:v=0:a=1,apad[aseq]"
+            f"{_lead_lbl}[h][gap][e][tail]concat=n={4 + _lead_n}:v=0:a=1,apad[aseq]"
         )
         wi_log = f"{wi_h},{wi_e}"
         mid_desc = f"ENDEC test (header+EOM+{tail_secs}s tail)"
@@ -823,7 +825,10 @@ def _clone_and_inject_eas(channel_id, original_profile, channel_name="", silence
             (_wav_duration_secs(_hdr) + _wav_duration_secs(_eom))
             if _eas_wav_available(header=gen_h, att=gen_a, eom=gen_e) else 6.0
         )
-        total_duration = header_eom + tail_secs + 1.0
+        # header + 1s gap + EOM + tail silence (+1s buffer so the screen doesn't
+        # vanish on the last sample). The 1s gap separates the header from the EOM
+        # so they don't run together and sound like one blurred burst.
+        total_duration = header_eom + 1.0 + tail_secs + 1.0
     else:
         # header + attention + (TTS or silence) + EOM, with a small tail so the
         # screen doesn't vanish the instant the last tone sample plays.
