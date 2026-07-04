@@ -341,24 +341,30 @@ def _build_eas_dasdec_filter(channel_id, page_line_map, page_secs, font=None):
     d = RUNTIME_DIR
     navy = "0x0A1E5C"
     red  = "0xC00000"
+    gold = "0xFFD200"
     margin = 22
-    title_size = 30
+    title_size = 34
     body_size  = 30
     line_h     = 42     # vertical spacing between centered body lines
 
     parts = [
         f"drawbox=x=0:y=0:w=iw:h=ih:color={navy}:t=fill",
         f"drawbox=x={margin}:y={margin}:w=iw-{margin*2}:h=ih-{margin*2}:color={red}:t=6",
+        # Title header at the very top (gold), centered.
+        f"drawtext=fontfile={font}:textfile={d}/eas_{channel_id}_dd_title.txt:reload=0"
+        f":fontsize={title_size}:fontcolor={gold}:x=(w-text_w)/2:y={margin + 16}",
     ]
 
+    # Body block is centered in the region BELOW the title and ABOVE the counter.
+    title_bottom = margin + 16 + title_size + 18
+    counter_top  = f"(h-{margin + 54})"
     page_count = max(1, len(page_line_map))
     for pi, line_idxs in enumerate(page_line_map):
         start = pi * page_secs
         end = (pi + 1) * page_secs if pi < page_count - 1 else 999999
         win = f":enable='between(t\\,{start:.2f}\\,{end})'" if page_count > 1 else ""
-        # Vertically center this page's block of lines.
         block_h = max(1, len(line_idxs)) * line_h
-        first_y = f"(h-{block_h})/2"
+        first_y = f"(({title_bottom}+{counter_top})/2 - {block_h}/2)"
         for row, li in enumerate(line_idxs):
             y = f"{first_y}+{row * line_h}"
             parts.append(
@@ -495,7 +501,7 @@ def _strip_dangerous_flags(channel_name, params):
     return params, removed
 
 def _inject_eas_wav_sequence(params, mid_path=None, mid_secs=15, endec_test=False, tail_secs=7.5,
-                             wav_header=None, wav_att=None, wav_eom=None):
+                             wav_header=None, wav_att=None, wav_eom=None, lead_in_secs=0.0):
     """Build a clean EAS audio sequence profile.
 
     wav_header / wav_att / wav_eom override the default pre-recorded tone files
@@ -550,6 +556,26 @@ def _inject_eas_wav_sequence(params, mid_path=None, mid_secs=15, endec_test=Fals
     existing_inputs = re.findall(r'-i\s+(?:"[^"]*"|\S+)', params)
     n = len(existing_inputs)
 
+    # Optional lead-in: a stretch of silence prepended to the whole sequence so
+    # the tones don't begin until the video overlay has actually appeared on
+    # screen. The overlay is drawn on the live source, which can take several
+    # seconds to connect, while the tone WAVs are local and would otherwise play
+    # immediately -- leaving the header tones running over a blank picture. The
+    # lead-in absorbs that startup gap so the overlay and the header tones come
+    # up together.
+    lead_in_secs = max(0.0, float(lead_in_secs or 0))
+    if lead_in_secs > 0:
+        _lead_clause = (
+            f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={lead_in_secs},"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[lead];"
+        )
+        _lead_lbl = "[lead]"
+        _lead_n = 1
+    else:
+        _lead_clause = ""
+        _lead_lbl = ""
+        _lead_n = 0
+
     if endec_test:
         # header -> EOM -> tail silence (no attention tones, no readout)
         wi_h = n       # eas_header.wav
@@ -567,7 +593,8 @@ def _inject_eas_wav_sequence(params, mid_path=None, mid_secs=15, endec_test=Fals
             f"[{wi_e}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[e];"
             f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={tail_secs},"
             f"aformat=sample_fmts=fltp:channel_layouts=stereo[tail];"
-            f"[h][e][tail]concat=n=3:v=0:a=1,apad[aseq]"
+            f"{_lead_clause}"
+            f"{_lead_lbl}[h][e][tail]concat=n={3 + _lead_n}:v=0:a=1,apad[aseq]"
         )
         wi_log = f"{wi_h},{wi_e}"
         mid_desc = f"ENDEC test (header+EOM+{tail_secs}s tail)"
@@ -600,7 +627,8 @@ def _inject_eas_wav_sequence(params, mid_path=None, mid_secs=15, endec_test=Fals
             f"[{wi_a}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a];"
             f"{mid_clause}"
             f"[{wi_e}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[e];"
-            f"[h][a][mid][e]concat=n=4:v=0:a=1,apad[aseq]"
+            f"{_lead_clause}"
+            f"{_lead_lbl}[h][a][mid][e]concat=n={4 + _lead_n}:v=0:a=1,apad[aseq]"
         )
         wi_log = f"{wi_h},{wi_a},{wi_e}"
         mid_desc = "TTS readout" if mid_path else f"{mid_secs}s silence"
@@ -719,7 +747,7 @@ def _clone_and_inject_eas(channel_id, original_profile, channel_name="", silence
                           transcode_mode="full", style="easyplus", unique_alerts=None,
                           use_tts=True, endec_test=False, tail_secs=7.5,
                           generate_tones=False, att_secs=8.0,
-                          easyplus_font=None, easyplus_scale=1.0):
+                          easyplus_font=None, easyplus_scale=1.0, lead_in_secs=0.0):
     """Clone the channel's profile into an EAS-overlay profile.
 
     Returns (profile, removed_flags, total_duration). total_duration is the
@@ -844,6 +872,7 @@ def _clone_and_inject_eas(channel_id, original_profile, channel_name="", silence
         params, mid_path=mid_path, mid_secs=mid_secs,
         endec_test=endec_test, tail_secs=tail_secs,
         wav_header=gen_h, wav_att=gen_a, wav_eom=gen_e,
+        lead_in_secs=lead_in_secs,
     )
 
     profile = StreamProfile(
@@ -860,7 +889,10 @@ def _clone_and_inject_eas(channel_id, original_profile, channel_name="", silence
         f"tts={'yes' if mid_path else 'no'})"
         + (f" (removed: {', '.join(removed_flags)})" if removed_flags else "")
     )
-    return profile, removed_flags, total_duration
+    # The restore countdown must cover the lead-in silence too (the overlay is
+    # on screen during it), so report the full wall-clock length. The visible
+    # tone/scroll/page timing above deliberately excludes the lead-in.
+    return profile, removed_flags, total_duration + max(0.0, float(lead_in_secs or 0))
 
 def _assign_profile(channel, profile):
     channel.stream_profile = profile
@@ -1418,6 +1450,7 @@ def _eas_process_restores(mappings, streaming_ids, now_ts):
                if m.get("eas_await_stream") or m.get("eas_restore_at")]
     for cid in pending:
         mapping = mappings.get(cid, {})
+        restore_at = mapping.get("eas_restore_at")
         if mapping.get("eas_await_stream"):
             if cid not in streaming_ids:
                 # Channel has gone down as expected after the profile swap.
@@ -1437,9 +1470,19 @@ def _eas_process_restores(mappings, streaming_ids, now_ts):
                     f"[EmergencyAlertarr] EAS: overlay live on ch {cid} -- "
                     f"restoring in {seq + _EAS_POST_RESUME_GRACE:.0f}s"
                 )
-            # else: awaiting, streaming but hasn't gone down yet -> keep waiting.
+                continue
+            # SAFETY NET: a channel that fired but never got a viewer never goes
+            # down/up, so it would otherwise stay armed forever. Once the safety
+            # deadline (set at fire time) passes, restore it anyway so a test or
+            # alert can never get stuck on an unwatched channel.
+            if restore_at and now_ts >= float(restore_at):
+                try:
+                    _eas_do_restore(cid, mapping, mappings)
+                    changed = True
+                    logger.info(f"[EmergencyAlertarr] EAS: safety-restored ch {cid} (viewer never returned)")
+                except Exception as e:
+                    logger.error(f"[EmergencyAlertarr] EAS: safety restore failed ch {cid}: {e}", exc_info=True)
             continue
-        restore_at = mapping.get("eas_restore_at")
         if restore_at and now_ts >= float(restore_at):
             try:
                 _eas_do_restore(cid, mapping, mappings)
@@ -1751,11 +1794,13 @@ def _eas_sweep():
                 except Exception:
                     att_secs = 8.0
                 _ep_font, _ep_scale = _easyplus_settings(settings)
+                _lead_in = float(settings.get("eas_lead_in_secs") or 0)
                 eas_profile, _, seq_duration = _clone_and_inject_eas(
                     channel.id, orig, channel.name, silence_secs, transcode_mode,
                     style=overlay_style, unique_alerts=single, use_tts=use_tts,
                     generate_tones=generate_tones, att_secs=att_secs,
                     easyplus_font=_ep_font, easyplus_scale=_ep_scale,
+                    lead_in_secs=_lead_in,
                 )
                 _assign_profile(channel, eas_profile)
                 _eas_write_alert(cid, single, style=overlay_style)
@@ -1957,12 +2002,14 @@ def _eas_fire_scheduled_test():
         fake_alerts = [_eas_build_test_alert(mode, now_utc, area=test_area)]
         try:
             _ep_font, _ep_scale = _easyplus_settings(settings)
+            _lead_in = float(settings.get("eas_lead_in_secs") or 0)
             eas_profile, _, seq_duration = _clone_and_inject_eas(
                 channel.id, orig, channel.name, silence_secs, transcode_mode,
                 style=overlay_style, unique_alerts=fake_alerts, use_tts=use_tts,
                 endec_test=endec_test, tail_secs=tail_secs,
                 generate_tones=generate_tones, att_secs=att_secs,
                 easyplus_font=_ep_font, easyplus_scale=_ep_scale,
+                lead_in_secs=_lead_in,
             )
             _assign_profile(channel, eas_profile)
             fake_alerts[0]["expires"] = (now_utc + timedelta(seconds=seq_duration)).isoformat()
@@ -2314,6 +2361,9 @@ class Plugin:
                  {"value": "720p",    "label": "720p — scaled down, source framerate (big CPU saving)"},
                  {"value": "720p30",  "label": "720p30 — scaled down & capped at 30fps (max CPU saving)"},
              ]},
+            {"id": "_eas_leadin_note", "type": "info",
+             "label": "Overlay lead-in: seconds of silence held before the alert tones start, so the on-screen overlay has time to appear first. The overlay is drawn on the live channel, which can take a few seconds to reconnect after switching to the alert, while the tones are instant — without a lead-in the header tones play over a blank picture. Set this roughly to how long your channels take to come back after a switch (4 is a good start; lower it if your streams reconnect fast, raise it if the tones still beat the picture)."},
+            {"id": "eas_lead_in_secs", "type": "number", "label": "Overlay Lead-in (seconds before tones, default 4)", "min": 0, "max": 15},
 
             # 4 - Alert audio
             {"id": "_eas_audio_header", "type": "info", "label": "──────  4 · ALERT AUDIO  ──────"},
@@ -2406,6 +2456,7 @@ class Plugin:
             "clean_orphans":        self._clean_orphans,
             "reset_all_eas":        self._reset_all_eas,
             "redis_diag":           self._redis_diag,
+            "fetch_alerts":         self._fetch_alerts_now,
             "reload_poller":        self._reload_poller,
             "restart_dispatcharr":  self._restart_dispatcharr,
         }
@@ -2602,6 +2653,7 @@ class Plugin:
 
         mappings  = _get_mappings()
         settings  = _get_settings()
+        streaming_ids = _eas_streaming_ids()
         fired, skipped, failed = [], [], []
 
         for channel in channels:
@@ -2609,6 +2661,11 @@ class Plugin:
             mapping = mappings.get(cid)
             if not mapping or (mapping.get("type") != "eas" and not mapping.get("eas_armed")):
                 skipped.append(f"{channel.name} (no EAS ticker active — enable it first)")
+                continue
+            if cid not in streaming_ids:
+                # Only fire on channels someone is actually watching, so a test
+                # can't leave the overlay stuck on idle channels.
+                skipped.append(f"{channel.name} (not currently being watched — tune to it first)")
                 continue
             if mapping.get("eas_profile_id"):
                 skipped.append(f"{channel.name} (EAS already active — clear it first)")
@@ -2646,6 +2703,7 @@ class Plugin:
                 fake_alerts = [_eas_build_test_alert(test_type, now_utc, area=test_area)]
 
                 _ep_font, _ep_scale = _easyplus_settings(settings)
+                _lead_in = float(settings.get("eas_lead_in_secs") or 0)
                 eas_profile, _, seq_duration = _clone_and_inject_eas(
                     channel.id, orig, channel.name,
                     silence_secs, transcode_mode,
@@ -2653,6 +2711,7 @@ class Plugin:
                     endec_test=endec_test, tail_secs=tail_secs,
                     generate_tones=generate_tones, att_secs=att_secs,
                     easyplus_font=_ep_font, easyplus_scale=_ep_scale,
+                    lead_in_secs=_lead_in,
                 )
                 _assign_profile(channel, eas_profile)
 
@@ -2764,11 +2823,15 @@ class Plugin:
         }]
 
         fired, skipped, failed = [], [], []
+        streaming_ids = _eas_streaming_ids()
         for channel in channels:
             cid = str(channel.id)
             mapping = mappings.get(cid)
             if not mapping or (mapping.get("type") != "eas" and not mapping.get("eas_armed")):
                 skipped.append(f"{channel.name} (EAS not enabled here)")
+                continue
+            if cid not in streaming_ids:
+                skipped.append(f"{channel.name} (not currently being watched — tune to it first)")
                 continue
             if mapping.get("eas_profile_id"):
                 skipped.append(f"{channel.name} (an alert is already active — wait for it to clear)")
@@ -2783,11 +2846,13 @@ class Plugin:
                     failed.append(f"{channel.name} (original profile missing)")
                     continue
                 _ep_font, _ep_scale = _easyplus_settings(settings)
+                _lead_in = float(settings.get("eas_lead_in_secs") or 0)
                 eas_profile, _, seq_duration = _clone_and_inject_eas(
                     channel.id, orig, channel.name, silence_secs, transcode_mode,
                     style=overlay_style, unique_alerts=custom_alert, use_tts=use_tts,
                     generate_tones=generate_tones, att_secs=att_secs,
                     easyplus_font=_ep_font, easyplus_scale=_ep_scale,
+                    lead_in_secs=_lead_in,
                 )
                 _assign_profile(channel, eas_profile)
                 _eas_write_alert(cid, custom_alert, style=overlay_style)
@@ -3033,6 +3098,75 @@ class Plugin:
             msg += "\n\nSome issues (non-fatal):\n" + "\n".join(f"  - {e}" for e in errors[:10])
         msg += "\n\nYou can now re-arm EAS from a clean slate."
         return {"success": True, "message": msg}
+
+    def _fetch_alerts_now(self, params):
+        """Diagnostic: poll NWS/IPAWS right now (instead of waiting for the timer),
+        show exactly what came back, and fire any genuinely new alerts on watched
+        channels using the normal seen-set logic (already-played alerts are not
+        replayed)."""
+        settings = _get_settings()
+        source = (settings.get("eas_source") or "nws").lower()
+        zones = [z.strip() for z in (settings.get("eas_zones") or "").split(",") if z.strip()]
+        severity = settings.get("eas_severity_filter") or "Moderate"
+
+        try:
+            alerts = _fetch_all_alerts(settings, zones, severity)
+        except Exception as e:
+            return {"success": False, "message": f"Fetch failed: {e}"}
+
+        rc = _get_redis_client()
+
+        # Snapshot the seen-set BEFORE firing so we can label new vs already-played.
+        seen = set(_eas_seen_mem.get("ids") or set())
+        if rc:
+            try:
+                raw = rc.get(_EAS_SEEN_KEY)
+                if raw:
+                    seen |= set(json.loads(raw if isinstance(raw, str) else raw.decode()))
+            except Exception:
+                pass
+        was_first_run = not _eas_seen_mem.get("init", False)
+
+        # Prime the cache with this exact fetch, then run the normal poll cycle so
+        # the standard logic fires only new alerts on channels that are watched.
+        if rc:
+            try:
+                rc.setex(_EAS_REDIS_KEY, _EAS_CACHE_TTL, json.dumps(alerts))
+            except Exception:
+                pass
+        try:
+            _eas_sweep()
+        except Exception as e:
+            logger.error(f"[EmergencyAlertarr] fetch-now sweep error: {e}", exc_info=True)
+
+        streaming_ids = _eas_streaming_ids(rc)
+        new_alerts = [a for a in alerts if a.get("id") not in seen]
+        lines = [
+            f"Polled {source.upper()} - {len(alerts)} active alert(s), {len(new_alerts)} new.",
+            f"Watched channels right now: {len(streaming_ids)}",
+            "",
+        ]
+        if not alerts:
+            lines.append("No active alerts for your configured area.")
+            lines.append("(Polling is working -- there's just nothing active. Use ALL codes/zones to test.)")
+        else:
+            for a in alerts:
+                src = "IPAWS" if str(a.get("id", "")).startswith("ipaws:") else "NWS"
+                area = (a.get("area") or "")
+                area = (area[:48] + "...") if len(area) > 48 else area
+                tag = "NEW" if a.get("id") not in seen else "already played"
+                lines.append(f"- [{src}] {a.get('event')} [{a.get('severity')}]"
+                             + (f" - {area}" if area else "") + f"  ({tag})")
+            lines.append("")
+            if was_first_run:
+                lines.append("First poll since (re)start: existing alerts were marked as seen and "
+                             "NOT fired (prevents a startup flood). New alerts from here on will fire.")
+            elif new_alerts:
+                lines.append(f"{len(new_alerts)} new alert(s) fired on any watched channel(s); "
+                             "already-played alerts were skipped.")
+            else:
+                lines.append("Nothing new to fire -- all active alerts were already played.")
+        return {"success": True, "message": "\n".join(lines)}
 
     def _redis_diag(self, params):
         # WAV tone file status first -- common cause of 'only one tone played'.

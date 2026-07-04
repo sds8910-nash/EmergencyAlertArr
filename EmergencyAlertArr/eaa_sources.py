@@ -13,11 +13,11 @@ from eaa_common import *
 logger = logging.getLogger(__name__)
 from eaa_tones import *
 
-__all__ = ['NWS_ALERTS_URL', 'NWS_UA', '_IPAWS_EAS_BASE', '_IPAWS_FEED_PATHS', '_NATIONAL_EVENT_CODES', '_alert_content_id', '_cap_local', '_cap_named_value', '_cap_same_codes', '_cap_text', '_fetch_all_alerts', '_fetch_ipaws_alerts', '_fetch_nws_alerts', '_is_national_alert', '_merge_dedupe_alerts', '_norm_ts', '_parse_cap_alert', '_same_codes_match']
+__all__ = ['NWS_ALERTS_URL', 'NWS_UA', '_IPAWS_EAS_BASE', '_IPAWS_FEED_PATHS', '_NATIONAL_EVENT_CODES', '_alert_content_id', '_cap_local', '_cap_named_value', '_cap_same_codes', '_cap_text', '_fetch_all_alerts', '_fetch_ipaws_alerts', '_fetch_nws_alerts', '_is_national_alert', '_merge_dedupe_alerts', '_norm_ts', '_parse_cap_alert', '_same_codes_match', '_summarize_alerts']
 
 NWS_ALERTS_URL  = "https://api.weather.gov/alerts/active"
 
-NWS_UA          = "EmergencyAlertarr/0.2"
+NWS_UA          = "EmergencyAlertarr/0.2 (github.com/jstevenscl/emergencyalertarr)"
 
 def _fetch_nws_alerts(zones, severity_threshold="Moderate"):
     # Special sentinel: "ALL" means nationwide -- query every active US alert
@@ -297,18 +297,37 @@ def _merge_dedupe_alerts(alerts):
         out.append(a)
     return out
 
+def _summarize_alerts(alerts, limit=8):
+    """Short human-readable summary of an alert list for the logs / diagnostics."""
+    alerts = alerts or []
+    if not alerts:
+        return "none active"
+    parts = []
+    for a in alerts[:limit]:
+        area = (a.get("area") or "")
+        area = (area[:34] + "…") if len(area) > 34 else area
+        parts.append(f'{a.get("event","?")} [{a.get("severity","?")}]' + (f" — {area}" if area else ""))
+    extra = f" (+{len(alerts) - limit} more)" if len(alerts) > limit else ""
+    return f"{len(alerts)}: " + " | ".join(parts) + extra
+
+
 def _fetch_all_alerts(settings, zones, severity_threshold="Moderate"):
     """Fetch the active alert set from whichever source(s) are enabled
     (NWS api.weather.gov and/or IPAWS-OPEN), merged into one list. Each source
     is isolated so a failure in one never blocks the other. The same alert
-    arriving from both sources is de-duplicated to a single entry."""
+    arriving from both sources is de-duplicated to a single entry. Every poll is
+    logged per source so you can confirm polling is actually happening."""
     source = (settings.get("eas_source") or "nws").lower()
-    alerts = []
-    if source in ("nws", "both") and zones:
-        try:
-            alerts.extend(_fetch_nws_alerts(zones, severity_threshold) or [])
-        except Exception as e:
-            logger.warning(f"[EmergencyAlertarr] EAS: NWS fetch failed: {e}")
+    nws_alerts, ipaws_alerts = [], []
+    if source in ("nws", "both"):
+        if zones:
+            try:
+                nws_alerts = _fetch_nws_alerts(zones, severity_threshold) or []
+            except Exception as e:
+                logger.warning(f"[EmergencyAlertarr] EAS: NWS fetch failed: {e}")
+            logger.info(f"[EmergencyAlertarr] NWS poll (zones={','.join(zones)}): {_summarize_alerts(nws_alerts)}")
+        else:
+            logger.info("[EmergencyAlertarr] NWS poll skipped: no zone/county codes set")
     if source in ("ipaws", "both"):
         feeds = [f.strip() for f in (settings.get("eas_ipaws_feeds") or "eas").split(",") if f.strip()]
         raw_codes = (settings.get("eas_ipaws_same_codes") or "").strip()
@@ -317,14 +336,15 @@ def _fetch_all_alerts(settings, zones, severity_threshold="Moderate"):
         else:
             same_filter = [c.strip() for c in raw_codes.replace(" ", "").split(",") if c.strip()]
         if not same_filter:
-            logger.warning(
-                "[EmergencyAlertarr] EAS: IPAWS is enabled but no county SAME codes are set "
-                "(EAS IPAWS County Codes) -- set 6-digit codes, or ALL for nationwide. "
-                "Skipping IPAWS."
+            logger.info(
+                "[EmergencyAlertarr] IPAWS poll skipped: no county SAME codes set "
+                "(set 6-digit codes, or ALL for nationwide)"
             )
         else:
             try:
-                alerts.extend(_fetch_ipaws_alerts(feeds, same_filter, severity_threshold) or [])
+                ipaws_alerts = _fetch_ipaws_alerts(feeds, same_filter, severity_threshold) or []
             except Exception as e:
                 logger.warning(f"[EmergencyAlertarr] EAS: IPAWS fetch failed: {e}")
-    return _merge_dedupe_alerts(alerts)
+            _codes = "ALL" if same_filter == ["ALL"] else ",".join(same_filter)
+            logger.info(f"[EmergencyAlertarr] IPAWS poll (codes={_codes}, feeds={','.join(feeds)}): {_summarize_alerts(ipaws_alerts)}")
+    return _merge_dedupe_alerts(nws_alerts + ipaws_alerts)
