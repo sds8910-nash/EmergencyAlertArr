@@ -341,7 +341,6 @@ def _build_eas_dasdec_filter(channel_id, page_line_map, page_secs, font=None):
     d = RUNTIME_DIR
     navy = "0x0A1E5C"
     red  = "0xC00000"
-    gold = "0xFFD200"
     margin = 22
     title_size = 34
     body_size  = 30
@@ -350,9 +349,9 @@ def _build_eas_dasdec_filter(channel_id, page_line_map, page_secs, font=None):
     parts = [
         f"drawbox=x=0:y=0:w=iw:h=ih:color={navy}:t=fill",
         f"drawbox=x={margin}:y={margin}:w=iw-{margin*2}:h=ih-{margin*2}:color={red}:t=6",
-        # Title header at the very top (gold), centered.
+        # Title header at the very top, centered (white, like the rest of DASDEC).
         f"drawtext=fontfile={font}:textfile={d}/eas_{channel_id}_dd_title.txt:reload=0"
-        f":fontsize={title_size}:fontcolor={gold}:x=(w-text_w)/2:y={margin + 16}",
+        f":fontsize={title_size}:fontcolor=white:x=(w-text_w)/2:y={margin + 16}",
     ]
 
     # Body block is centered in the region BELOW the title and ABOVE the counter.
@@ -377,6 +376,66 @@ def _build_eas_dasdec_filter(channel_id, page_line_map, page_secs, font=None):
                 f":fontsize=26:fontcolor=white:x=(w-text_w)/2:y=h-{margin+40}{win}"
             )
     return ",".join(parts)
+
+def _build_eas_easyplus_ticker_filter(channel_id, total_duration=60, font=None, scale=1.0):
+    """EASyPlus 'Scroll Ticker Only' -- the Trilithic EASy CGEN ticker: just the
+    crawl over the live video. A black bar near the top of the screen with white
+    monospace text scrolling right-to-left; the rest of the program stays
+    visible. (No full-screen takeover.)"""
+    font = font or _font_for("easyplus")
+    if not font:
+        raise RuntimeError("No overlay font available (ship fonts/EASyText.ttf).")
+    d = RUNTIME_DIR
+    try:
+        scale = float(scale)
+    except Exception:
+        scale = 1.0
+    scale = max(0.5, min(3.0, scale))
+    txt_sz = max(10, int(round(46 * scale)))
+    band_h = int(round(txt_sz * 1.7))     # black bar height
+    total_duration = max(5.0, float(total_duration))
+    scroll_x = f"w-t*((w+text_w+80)/{total_duration:.3f})"
+    return (
+        # Black bar across the top; everything else shows the live program.
+        f"drawbox=x=0:y=ih*0.05:w=iw:h={band_h}:color=black:t=fill,"
+        f"drawtext=fontfile={font}"
+        f":textfile={d}/eas_{channel_id}_ep_area.txt:reload=1"
+        f":fontsize={txt_sz}:fontcolor=white"
+        f":x={scroll_x}:y=h*0.05+({band_h}-text_h)/2"
+    )
+
+def _build_eas_dasdec_scroll_filter(channel_id, total_duration=60, font=None):
+    """DASDEC 'Scroll' banner used by Cox/Spectrum (and legacy TWC/Charter): a
+    gray two-row bar near the top over the live video. Top row is a static
+    'Emergency Alert Message' label; bottom row is the DASDEC-form alert details
+    scrolling right-to-left. The program stays visible below the bar."""
+    font = font or _font_for("dasdec")
+    if not font:
+        raise RuntimeError("No overlay font available (ship fonts/luximb.ttf).")
+    d = RUNTIME_DIR
+    row_sz = 30
+    row1_h = int(round(row_sz * 1.5))     # label row
+    row2_h = int(round(row_sz * 1.6))     # scroll row
+    band_h = row1_h + row2_h
+    gray_top = "0x1C1C1C"                  # slightly darker label strip
+    gray_bot = "0x333333"                  # scroll strip
+    total_duration = max(5.0, float(total_duration))
+    scroll_x = f"w-t*((w+text_w+80)/{total_duration:.3f})"
+    return (
+        # Two stacked gray strips near the top; live program shows below.
+        f"drawbox=x=0:y=ih*0.05:w=iw:h={row1_h}:color={gray_top}:t=fill,"
+        f"drawbox=x=0:y=ih*0.05+{row1_h}:w=iw:h={row2_h}:color={gray_bot}:t=fill,"
+        # top row: static label
+        f"drawtext=fontfile={font}"
+        f":textfile={d}/eas_{channel_id}_dd_scroll_title.txt:reload=0"
+        f":fontsize={row_sz}:fontcolor=white"
+        f":x=24:y=h*0.05+({row1_h}-text_h)/2,"
+        # bottom row: scrolling DASDEC-form details
+        f"drawtext=fontfile={font}"
+        f":textfile={d}/eas_{channel_id}_dd_scroll.txt:reload=1"
+        f":fontsize={row_sz}:fontcolor=white"
+        f":x={scroll_x}:y=h*0.05+{row1_h}+({row2_h}-text_h)/2"
+    )
 
 def _inject_drawtext(params, drawtext_filter):
     is_audio_only = "-vn" in params or (
@@ -844,33 +903,33 @@ def _clone_and_inject_eas(channel_id, original_profile, channel_name="", silence
         )
         total_duration = float(_EAS_MAX_ALERT_SECS)
     # --- Build the video overlay filter for the chosen style -----------------
-    # Both styles render as a plain -vf drawtext chain (then _inject_drawtext +
-    # _inject_eas_wav_sequence) -- the same reliable path. EASyPlus is a black
-    # takeover with a scrolling crawl; DASDEC is the static, paginated navy/red
-    # cable-headend character-generator screen.
+    # Full-takeover styles (easyplus / dasdec) cover the whole screen; crawl
+    # styles (easyplus_ticker / dasdec_scroll) draw only a band and leave the
+    # live program visible. All render as a plain -vf drawtext chain.
     transcode_prefix = _EAS_TRANSCODE_PREFIXES.get(transcode_mode, "")
+    _font_ep = _resolve_font(easyplus_font, "easyplus")
+    _font_dd = _resolve_font(easyplus_font, "dasdec")
     if style == "dasdec":
-        # DASDEC is a full takeover (no source video shows through) rendered with
-        # many drawtext lines, so default it to a light 720p/15fps encode when the
-        # user hasn't picked a transcode quality -- keeps it fast without any
-        # visible quality loss. An explicit choice is respected.
+        # Full DASDEC takeover: no source shows through and it's drawtext-heavy,
+        # so default it to a light 720p/15fps encode when the user hasn't chosen
+        # a transcode quality. (Crawl styles skip this -- the program is visible.)
         if transcode_mode == "full":
             transcode_prefix = "scale=1280:720:flags=fast_bilinear,fps=fps=15,"
         dd_texts = _eas_alert_texts(unique_alerts or [])
         block_lines = _eas_dasdec_block_lines(unique_alerts or [], dd_texts)
         _atomic_write(f"eas_{channel_id}_dd_title.txt", "Emergency Alert Details")
-        page_line_map, page_secs = _eas_dasdec_pages(
-            channel_id, block_lines, total_duration
-        )
+        page_line_map, page_secs = _eas_dasdec_pages(channel_id, block_lines, total_duration)
         eas_filter = transcode_prefix + _build_eas_dasdec_filter(
-            channel_id, page_line_map, page_secs,
-            font=_resolve_font(easyplus_font, "dasdec"),
-        )
+            channel_id, page_line_map, page_secs, font=_font_dd)
+    elif style == "easyplus_ticker":
+        eas_filter = transcode_prefix + _build_eas_easyplus_ticker_filter(
+            channel_id, total_duration=total_duration, font=_font_ep, scale=easyplus_scale)
+    elif style == "dasdec_scroll":
+        eas_filter = transcode_prefix + _build_eas_dasdec_scroll_filter(
+            channel_id, total_duration=total_duration, font=_font_dd)
     else:
         eas_filter = transcode_prefix + _build_eas_easyplus_filter(
-            channel_id, total_duration=total_duration,
-            font=_resolve_font(easyplus_font, "easyplus"), scale=easyplus_scale,
-        )
+            channel_id, total_duration=total_duration, font=_font_ep, scale=easyplus_scale)
 
     params = _inject_drawtext(cleaned_params, eas_filter)
     params = _inject_eas_wav_sequence(
@@ -1153,6 +1212,15 @@ def _eas_write_alert(channel_id, unique_alerts, style="easyplus"):
         _atomic_write(f"eas_{channel_id}_dd_title.txt", "Emergency Alert Details")
         # Nominal duration -- the clone-time call writes the authoritative timing.
         _eas_dasdec_pages(channel_id, block_lines, 60.0)
+    elif style == "dasdec_scroll":
+        # DASDEC scroll banner: a static label row + the DASDEC-form sentence as
+        # one scrolling line.
+        block_lines = _eas_dasdec_block_lines(unique_alerts, texts)
+        _atomic_write(f"eas_{channel_id}_dd_scroll_title.txt", "Emergency Alert Message")
+        _atomic_write(f"eas_{channel_id}_dd_scroll.txt", " ".join(block_lines))
+    elif style == "easyplus_ticker":
+        # Ticker-only: just the scrolling crawl line (reuses the ep_area file).
+        _atomic_write(f"eas_{channel_id}_ep_area.txt", texts["scroll"])
     else:
         # EASyPlus: black takeover with a scrolling crawl (ep_* files).
         _atomic_write(f"eas_{channel_id}_ep_header.txt", "EMERGENCY ALERT SYSTEM")
@@ -2339,16 +2407,23 @@ class Plugin:
                  {"value": "Severe",   "label": "Warnings and up (Severe+)"},
                  {"value": "Extreme",  "label": "Emergencies only (Extreme)"},
              ]},
+            {"id": "_eas_onlyreal_note", "type": "info",
+             "label": "EAS-only filter (recommended, especially with ALL zones): NWS sends many products that a real EAS encoder never relays — heat advisories, air-quality alerts, etc. Turn this on to fire only on products that would actually hit EAS: it drops alerts the NWS marks as blocked from EAS and alerts with no real SAME event code. National alerts (EAN/NPT/PEP) always pass. Optionally restrict further with allow/block event-code lists below (3-letter SAME codes like TOR, SVR, FFW)."},
+            {"id": "eas_only_real", "type": "boolean", "label": "Only fire on real EAS products (skip heat/air-quality/etc.)"},
+            {"id": "eas_event_allow", "type": "text", "label": "Only these event codes (optional allow-list, e.g. TOR,SVR,FFW)", "placeholder": "blank = allow all EAS events"},
+            {"id": "eas_event_block", "type": "text", "label": "Never these event codes (optional block-list)", "placeholder": "e.g. SVR,SPS"},
             {"id": "eas_poll_interval",   "type": "number", "label": "How often to check for alerts (seconds, min 15, default 60)", "min": 15},
 
             # 2 - On-screen look
             {"id": "_eas_ovl_header", "type": "info", "label": "──────  2 · ON-SCREEN LOOK  ──────"},
             {"id": "_eas_overlay_style_note", "type": "info",
-             "label": "How the alert screen looks. EASyPlus = classic broadcast EAS generator: full-screen black, large centered white text with a scrolling alert line. DASDEC = cable-headend look: navy background, red border, centered monospace text worded like a real ENDEC ('… has issued … for the following counties or areas …'), auto-paginated with a page counter for long alerts."},
+             "label": "How the alert appears. Full-screen takeovers replace the channel: EASyPlus = classic broadcast EAS generator (black, centered white text, scrolling line); DASDEC = cable-headend look (navy, red border, centered monospace, paginated). Crawl styles keep the live program visible with just a bar on top: EASyPlus Ticker = black bar, white scrolling text (Trilithic EASy CGEN ticker); DASDEC Scroll = gray two-row bar, 'Emergency Alert Message' label over the scrolling details (Cox/Spectrum style). All still play the EAS tones."},
             {"id": "eas_overlay_style", "type": "select", "label": "Alert Overlay Style",
              "options": [
-                 {"value": "easyplus", "label": "EASyPlus — classic broadcast EAS character generator"},
-                 {"value": "dasdec",   "label": "DASDEC — cable-headend style (navy, red border, paginated)"},
+                 {"value": "easyplus",        "label": "EASyPlus — full-screen broadcast EAS takeover"},
+                 {"value": "dasdec",          "label": "DASDEC — full-screen cable-headend takeover (navy/red, paginated)"},
+                 {"value": "easyplus_ticker", "label": "EASyPlus Ticker — crawl only (black bar, over live video)"},
+                 {"value": "dasdec_scroll",   "label": "DASDEC Scroll — gray 2-row banner crawl (Cox/Spectrum, over live video)"},
              ]},
             {"id": "_eas_epfont_note", "type": "info",
              "label": "Font (optional override): EASyPlus uses the bundled fonts/EASyText.ttf and DASDEC uses fonts/luximb.ttf. To override, drop a .ttf/.otf into the plugin fonts/ folder and put its filename here (an absolute path or system-font name also works). Leave blank to use the bundled font; a name that can't be found falls back to it."},

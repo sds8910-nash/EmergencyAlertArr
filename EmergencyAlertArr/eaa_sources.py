@@ -13,7 +13,7 @@ from eaa_common import *
 logger = logging.getLogger(__name__)
 from eaa_tones import *
 
-__all__ = ['NWS_ALERTS_URL', 'NWS_UA', '_IPAWS_EAS_BASE', '_IPAWS_FEED_PATHS', '_NATIONAL_EVENT_CODES', '_alert_content_id', '_cap_local', '_cap_named_value', '_cap_same_codes', '_cap_text', '_fetch_all_alerts', '_fetch_ipaws_alerts', '_fetch_nws_alerts', '_is_national_alert', '_merge_dedupe_alerts', '_norm_ts', '_parse_cap_alert', '_same_codes_match', '_summarize_alerts']
+__all__ = ['NWS_ALERTS_URL', 'NWS_UA', '_IPAWS_EAS_BASE', '_IPAWS_FEED_PATHS', '_NATIONAL_EVENT_CODES', '_alert_content_id', '_cap_local', '_cap_named_value', '_cap_same_codes', '_cap_text', '_eas_only_filter', '_fetch_all_alerts', '_fetch_ipaws_alerts', '_fetch_nws_alerts', '_is_national_alert', '_merge_dedupe_alerts', '_norm_ts', '_parse_cap_alert', '_same_codes_match', '_summarize_alerts']
 
 NWS_ALERTS_URL  = "https://api.weather.gov/alerts/active"
 
@@ -60,6 +60,15 @@ def _fetch_nws_alerts(zones, severity_threshold="Moderate"):
             same_codes = list((props.get("geocode") or {}).get("SAME") or [])
         except Exception:
             pass
+        # BLOCKCHANNEL lists the dissemination channels an alert is BLOCKED from.
+        # "EAS" here means the NWS did not send this product to EAS (e.g. heat
+        # advisories, air-quality alerts) -- used by the EAS-only filter.
+        block_channels = []
+        try:
+            block_channels = [str(x).upper() for x in
+                              ((props.get("parameters") or {}).get("BLOCKCHANNEL") or [])]
+        except Exception:
+            pass
         alerts.append({
             "id":          props.get("id", ""),
             "event":       props.get("event", "Weather Alert"),
@@ -76,6 +85,7 @@ def _fetch_nws_alerts(zones, severity_threshold="Moderate"):
             "sender":      "National Weather Service",
             "event_code":  ev_code,
             "same_codes":  same_codes,
+            "blockchannel": block_channels,
             "originator":  "WXR",   # NWS originator code
         })
     return alerts
@@ -173,18 +183,34 @@ def _parse_cap_alert(el):
         return None
     sender_name = _cap_text(el, "senderName") or _cap_text(el, "sender") or "Emergency Alert System"
     severity = _cap_text(el, "severity") or "Unknown"
-    # Origin: only weather-service alerts get WXR (which keeps the WHAT/WHERE/WHEN
-    # formatting); civil/AMBER/law-enforcement alerts get CIV so they render as
-    # plain prose. Don't use _same_org_for here -- its WXR default would wrongly
-    # treat every non-matching civil sender as NWS.
+    # Prefer the SAME originator the feed states explicitly in the EAS-ORG
+    # parameter (PEP/CIV/WXR/EAS). Only fall back to inferring it from the
+    # sender name when EAS-ORG is missing. Originator drives formatting: WXR
+    # keeps the WHAT/WHERE/WHEN layout; CIV/PEP/EAS render as plain prose.
+    eas_org = (_cap_named_value(el, "parameter", "EAS-ORG") or "").strip().upper()
     _sn = sender_name.lower()
-    if any(k in _sn for k in ("nws", "national weather", "weather service", "noaa")):
+    if eas_org in ("PEP", "CIV", "WXR", "EAS"):
+        originator = eas_org
+        if eas_org == "WXR":
+            sender_name = "National Weather Service"
+    elif any(k in _sn for k in ("nws", "national weather", "weather service", "noaa")):
         originator = "WXR"
         sender_name = "National Weather Service"
     elif "primary entry" in _sn or "pep" in _sn.replace("/", " ").split():
         originator = "PEP"   # Primary Entry Point -- national activation
     else:
         originator = "CIV"
+    # Tidy the display sender: IPAWS COG names look like
+    # "201057,Public - Chelan County, WA,CHELAN COUNTY" -- strip the leading COG
+    # id and "Public - " prefix for a cleaner "Message from ..." line.
+    if originator != "WXR":
+        _disp = re.sub(r"^\s*\d+\s*,\s*", "", sender_name)          # drop leading COG id
+        _m = re.search(r"Public\s*-\s*(.+)", _disp)
+        if _m:
+            _disp = _m.group(1)
+        _disp = ", ".join([p.strip() for p in _disp.split(",")[:2] if p.strip()])
+        if _disp:
+            sender_name = _disp
     return {
         "id":          "ipaws:" + ident,
         "event":       _cap_text(el, "event") or "Emergency Alert",
@@ -311,6 +337,43 @@ def _summarize_alerts(alerts, limit=8):
     return f"{len(alerts)}: " + " | ".join(parts) + extra
 
 
+def _eas_only_filter(alerts, settings):
+    """'Behave like a real ENDEC' filtering for NWS products:
+      - eas_only_real: drop alerts BLOCKED from EAS (BLOCKCHANNEL contains EAS)
+        or lacking a real SAME event code (non-EAS products like heat/air-quality
+        carry event_code "NWS" or none).
+      - eas_event_block: drop alerts whose SAME event code is in this list.
+      - eas_event_allow: if set, keep ONLY alerts whose SAME event code is listed.
+    National alerts (EAN/NPT/PEP/000000) always pass. Returns (kept, dropped_desc)."""
+    val = settings.get("eas_only_real")
+    only_real = (val is True) or (str(val).strip().lower() in ("1", "true", "yes", "on"))
+    allow = {c.strip().upper() for c in (settings.get("eas_event_allow") or "").replace(" ", "").split(",") if c.strip()}
+    block = {c.strip().upper() for c in (settings.get("eas_event_block") or "").replace(" ", "").split(",") if c.strip()}
+    if not (only_real or allow or block):
+        return alerts, []
+    kept, dropped = [], []
+    for a in alerts:
+        if _is_national_alert(a):
+            kept.append(a)
+            continue
+        ec = (a.get("event_code") or "").strip().upper()
+        reason = None
+        if only_real:
+            if "EAS" in (a.get("blockchannel") or []):
+                reason = "blocked from EAS"
+            elif ec in ("", "NWS"):
+                reason = "no real SAME event code"
+        if reason is None and block and ec in block:
+            reason = f"event {ec} blocked"
+        if reason is None and allow and ec not in allow:
+            reason = f"event {ec} not in allow list"
+        if reason:
+            dropped.append(f'{a.get("event")} ({reason})')
+        else:
+            kept.append(a)
+    return kept, dropped
+
+
 def _fetch_all_alerts(settings, zones, severity_threshold="Moderate"):
     """Fetch the active alert set from whichever source(s) are enabled
     (NWS api.weather.gov and/or IPAWS-OPEN), merged into one list. Each source
@@ -325,6 +388,10 @@ def _fetch_all_alerts(settings, zones, severity_threshold="Moderate"):
                 nws_alerts = _fetch_nws_alerts(zones, severity_threshold) or []
             except Exception as e:
                 logger.warning(f"[EmergencyAlertarr] EAS: NWS fetch failed: {e}")
+            nws_alerts, _dropped = _eas_only_filter(nws_alerts, settings)
+            if _dropped:
+                logger.info(f"[EmergencyAlertarr] NWS EAS-only filter dropped {len(_dropped)}: "
+                            + "; ".join(_dropped[:8]) + (" …" if len(_dropped) > 8 else ""))
             logger.info(f"[EmergencyAlertarr] NWS poll (zones={','.join(zones)}): {_summarize_alerts(nws_alerts)}")
         else:
             logger.info("[EmergencyAlertarr] NWS poll skipped: no zone/county codes set")
