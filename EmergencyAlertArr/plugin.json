@@ -39,13 +39,6 @@
       }
     },
     {
-      "id": "migrate_eas",
-      "label": "Migrate EAS to Dynamic Mode",
-      "confirm": {
-        "message": "This restores all EAS channels to their original passthrough profiles and removes any old always-on re-encode profiles. Channels will automatically switch to the EAS overlay only when a real alert fires. Continue?"
-      }
-    },
-    {
       "id": "_header_manage",
       "type": "info",
       "label": "-- Manage --"
@@ -67,13 +60,6 @@
       "label": "Clear Alert History",
       "confirm": {
         "message": "This will permanently erase the recorded EAS alert history. Continue?"
-      }
-    },
-    {
-      "id": "clean_orphans",
-      "label": "Clean Orphaned Profiles",
-      "confirm": {
-        "message": "This will delete all EmergencyAlertarr-cloned stream profiles that have no active channel mapping. Continue?"
       }
     },
     {

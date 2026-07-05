@@ -2530,10 +2530,8 @@ class Plugin:
             "inject_alert":         self._inject_alert,
             "view_history":         self._view_history,
             "clear_history":        self._clear_history,
-            "migrate_eas":          self._migrate_eas,
             "view_active":          self._view_active,
             "refresh_channels":     self._refresh_channels,
-            "clean_orphans":        self._clean_orphans,
             "reset_all_eas":        self._reset_all_eas,
             "redis_diag":           self._redis_diag,
             "fetch_alerts":         self._fetch_alerts_now,
@@ -3000,52 +2998,6 @@ class Plugin:
         return {"success": True, "message": "EAS alert history cleared."}
 
 
-    def _migrate_eas(self, params):
-        """Migrate old always-on EAS profiles (ticker_profile_id) to dynamic mode."""
-        from apps.channels.models import Channel
-
-        mappings = _get_mappings()
-        old_eas = {cid: m for cid, m in mappings.items()
-                   if m and m.get("type") == "eas" and m.get("ticker_profile_id")}
-        if not old_eas:
-            return {"success": True, "message": "No old static EAS profiles found - all EAS channels are already in dynamic mode."}
-
-        migrated, failed = [], []
-        for cid, mapping in old_eas.items():
-            name = mapping.get("channel_name", f"Channel {cid}")
-            try:
-                channel = Channel.objects.filter(id=int(cid)).first()
-                if channel:
-                    _restore_profile(channel, mapping.get("original_profile_id"))
-                    _restart_channel_stream_async(channel, label="EAS")
-                _delete_cloned_profile(mapping["ticker_profile_id"])
-                mapping.pop("ticker_profile_id", None)
-                mapping.pop("eas_profile_id", None)
-                mappings[cid] = mapping
-                with _eas_lock:
-                    _eas_active.pop(cid, None)
-                migrated.append(name)
-            except Exception as e:
-                logger.error(f"emergencyalertarr: migrate EAS failed for {name}: {e}", exc_info=True)
-                failed.append(f"{name} ({e})")
-
-        _save_mappings(mappings)
-        rc = _get_redis_client()
-        if rc:
-            try:
-                rc.delete(_EAS_STATE_KEY, _EAS_OWNER_KEY)
-            except Exception:
-                pass
-
-        parts = []
-        if migrated:
-            parts.append(f"Migrated {len(migrated)} channel(s) to dynamic EAS:\n" + "\n".join(f"  - {n}" for n in migrated))
-            parts.append("Channels restored to passthrough profiles. Re-encoding only occurs when a real NWS alert fires.")
-        if failed:
-            parts.append("Failed:\n" + "\n".join(f"  - {f}" for f in failed))
-        return {"success": not failed, "message": "\n\n".join(parts) or "Nothing to do."}
-
-
     def _view_active(self, params):
         mappings = _get_mappings()
         if not mappings:
@@ -3062,46 +3014,6 @@ class Plugin:
 
     def _refresh_channels(self, params):
         return {"success": True, "message": "Channel refresh not available in EAS-only mode."}
-
-    def _clean_orphans(self, params):
-        from core.models import StreamProfile
-        mappings = _get_mappings()
-        # Collect every profile id still referenced by any mapping -- both the
-        # legacy ticker clones and the EAS clones. Use .get() since legacy/
-        # EAS-only mappings won't have every key (a missing key here previously
-        # crashed this action with KeyError: 'ticker_profile_id').
-        active_ticker_ids = set()
-        for m in mappings.values():
-            if not isinstance(m, dict):
-                continue
-            for key in ("ticker_profile_id", "eas_profile_id"):
-                pid = m.get(key)
-                if pid:
-                    active_ticker_ids.add(pid)
-
-        # Primary sweep: profiles whose name starts with PROFILE_PREFIX
-        named = list(StreamProfile.objects.filter(name__startswith=PROFILE_PREFIX))
-        orphans = [p for p in named if p.id not in active_ticker_ids]
-
-        # Secondary sweep: catch FIFO-era leftovers whose name didn't use the current
-        # prefix (different dash, older naming) but whose parameters contain emergencyalertarr_data
-        seen_ids = {p.id for p in named}
-        for p in StreamProfile.objects.all():
-            if p.id in seen_ids or p.id in active_ticker_ids:
-                continue
-            if "emergencyalertarr_data" in (p.parameters or ""):
-                orphans.append(p)
-
-        if not orphans:
-            return {"success": True, "message": "No orphaned profiles found."}
-        deleted = []
-        for profile in orphans:
-            try:
-                profile.delete()
-                deleted.append(profile.name)
-            except Exception as e:
-                logger.warning(f"emergencyalertarr: could not delete profile {profile.name}: {e}")
-        return {"success": True, "message": f"Deleted {len(deleted)} orphaned profile(s):\n" + "\n".join(f"  - {n}" for n in deleted)}
 
     def _reset_all_eas(self, params):
         """Full clean slate: restore every channel's original profile, delete ALL
