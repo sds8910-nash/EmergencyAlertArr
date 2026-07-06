@@ -21,10 +21,16 @@ Alerts play one at a time. Nothing fires on channels nobody's tuned to, and ever
 even if the viewer wanders off mid-alert.
 
 ## Requirements
-- Dispatcharr, obviously.
--  - espeak-ng in the Dispatcharr container if you want the spoken readout (apt-get install espeak-ng). Without it, alerts just use a silent gap instead
--  — everything else still works.
--  - FFmpeg with libx264 (Dispatcharr already has this).
+
+- **Dispatcharr** (required)
+- **eSpeak NG** (optional, for spoken alert readouts)
+  - Install inside the Dispatcharr container:
+    ```bash
+    apt-get update && apt-get install -y espeak-ng
+    ```
+  - Without eSpeak NG, alerts will use a silent gap instead of spoken audio.
+- **FFmpeg** with **libx264** support
+  - Dispatcharr already includes a compatible FFmpeg build, so no additional setup is required.
 
 ## Overlay styles
 
