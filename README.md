@@ -1,6 +1,6 @@
 # EmergencyAlertarr
 
-An EAS plugin for Dispatcharr. It watches the NWS and
+An EAS plugin for Dispatcharr(https://github.com/Dispatcharr/Dispatcharr). It watches the NWS and
 IPAWS feeds for active alerts, and when one is issued for your area it interrupts whatever channel
 you're watching with a broadcast-style EAS screen and the real SAME/attention tones — then restores
 the stream once the alert clears.
