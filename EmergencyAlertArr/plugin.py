@@ -341,14 +341,16 @@ def _build_eas_dasdec_filter(channel_id, page_line_map, page_secs, font=None):
     d = RUNTIME_DIR
     navy = "0x0A1E5C"
     red  = "0xC00000"
+    border_t = 16       # red frame thickness, flush to the screen edge
     margin = 22
     title_size = 34
     body_size  = 30
     line_h     = 42     # vertical spacing between centered body lines
 
     parts = [
+        # Navy fill, then a red frame flush to the very edge (no navy outside it).
         f"drawbox=x=0:y=0:w=iw:h=ih:color={navy}:t=fill",
-        f"drawbox=x={margin}:y={margin}:w=iw-{margin*2}:h=ih-{margin*2}:color={red}:t=6",
+        f"drawbox=x=0:y=0:w=iw:h=ih:color={red}:t={border_t}",
         # Title header at the very top, centered (white, like the rest of DASDEC).
         f"drawtext=fontfile={font}:textfile={d}/eas_{channel_id}_dd_title.txt:reload=0"
         f":fontsize={title_size}:fontcolor=white:x=(w-text_w)/2:y={margin + 16}",
@@ -379,9 +381,9 @@ def _build_eas_dasdec_filter(channel_id, page_line_map, page_secs, font=None):
 
 def _build_eas_easyplus_ticker_filter(channel_id, total_duration=60, font=None, scale=1.0):
     """EASyPlus 'Scroll Ticker Only' -- the Trilithic EASy CGEN ticker: just the
-    crawl over the live video. A black bar near the top of the screen with white
-    monospace text scrolling right-to-left; the rest of the program stays
-    visible. (No full-screen takeover.)"""
+    crawl over the live video. A black bar in the upper-middle of the screen with
+    white monospace text scrolling slowly right-to-left; the rest of the program
+    stays visible. (No full-screen takeover.)"""
     font = font or _font_for("easyplus")
     if not font:
         raise RuntimeError("No overlay font available (ship fonts/EASyText.ttf).")
@@ -391,17 +393,19 @@ def _build_eas_easyplus_ticker_filter(channel_id, total_duration=60, font=None, 
     except Exception:
         scale = 1.0
     scale = max(0.5, min(3.0, scale))
-    txt_sz = max(10, int(round(46 * scale)))
-    band_h = int(round(txt_sz * 1.7))     # black bar height
-    total_duration = max(5.0, float(total_duration))
-    scroll_x = f"w-t*((w+text_w+80)/{total_duration:.3f})"
+    txt_sz = max(10, int(round(42 * scale)))
+    band_h = int(round(txt_sz * 1.8))     # black bar height
+    band_top = "ih*0.16"                   # upper-middle, off the very top
+    # Slow, resolution-independent scroll that loops continuously for the whole
+    # alert (constant readable visual speed regardless of alert length). Lower
+    # the 0.055 factor for an even slower crawl.
+    scroll_x = f"w-mod(t*(w*0.055)\\,w+text_w+160)"
     return (
-        # Black bar across the top; everything else shows the live program.
-        f"drawbox=x=0:y=ih*0.05:w=iw:h={band_h}:color=black:t=fill,"
+        f"drawbox=x=0:y={band_top}:w=iw:h={band_h}:color=black:t=fill,"
         f"drawtext=fontfile={font}"
         f":textfile={d}/eas_{channel_id}_ep_area.txt:reload=1"
         f":fontsize={txt_sz}:fontcolor=white"
-        f":x={scroll_x}:y=h*0.05+({band_h}-text_h)/2"
+        f":x={scroll_x}:y=h*0.16+({band_h}-text_h)/2"
     )
 
 def _build_eas_dasdec_scroll_filter(channel_id, total_duration=60, font=None):
@@ -1002,7 +1006,7 @@ def _eas_alert_texts(unique_alerts):
         return {}
 
     def _area(a):
-        return (a.get("area") or "").replace("; ", "  ·  ").strip()
+        return (a.get("area") or "").replace("; ", "  *  ").strip()
 
     def _is_nws(a):
         # NWS alerts (originator WXR) use the "* WHAT... * WHERE... * WHEN..."
@@ -1089,9 +1093,9 @@ def _eas_alert_texts(unique_alerts):
     else:
         event_text = " / ".join(a["event"].upper() for a in unique_alerts)
         area_text = "; ".join(_area(a) for a in unique_alerts if _area(a)) or "ALL AREAS"
-        headline_text = "   •••   ".join(_headline(a) for a in unique_alerts if _headline(a))
-        description_text = "   •••   ".join(_description(a) for a in unique_alerts if _description(a))
-        description_paras = "\n\n•••\n\n".join(_description_paragraphs(a) for a in unique_alerts if _description_paragraphs(a))
+        headline_text = "   ***   ".join(_headline(a) for a in unique_alerts if _headline(a))
+        description_text = "   ***   ".join(_description(a) for a in unique_alerts if _description(a))
+        description_paras = "\n\n***\n\n".join(_description_paragraphs(a) for a in unique_alerts if _description_paragraphs(a))
         instruction_text = "  ".join(_instruction(a) for a in unique_alerts if _instruction(a))
         sender_text = unique_alerts[0].get("sender") or "EAS Participant"
         effective_text = _fmt_time(unique_alerts[0].get("effective"), fallback="Now")
@@ -1100,9 +1104,9 @@ def _eas_alert_texts(unique_alerts):
 
     scroll_text = f"{area_text}.  Effective Until {expires_text}"
     if headline_text:
-        scroll_text += f"     •••     {headline_text}"
+        scroll_text += f"     ***     {headline_text}"
     if description_text:
-        scroll_text += f"     •••     {description_text}"
+        scroll_text += f"     ***     {description_text}"
 
     # Plain-language sentence form for the TTS readout -- avoid the "|" / "•••"
     # scroll separators, which read aloud as awkward noise.
@@ -1356,6 +1360,90 @@ _EAS_TICK_SECS = 3
 
 _EAS_LOGGED_CHANSERVICE_API = False
 
+# --- FCC-style EAS log + webhook notifications -----------------------------
+_EAS_LOG_FILE = os.path.join(_DATA_DIR, "eas_fcc_log.csv")
+_EAS_LOG_MAX_ROWS = 2000
+_eas_log_lock = threading.Lock()
+
+
+def _eas_log_event(action, event="", severity="", area="", channels="", note=""):
+    """Append one row to the FCC-style EAS log (eas_fcc_log.csv): an append-only
+    record of every alert action -- FIRED / TEST / INJECT / RESTORED -- with when,
+    what, and where. Trimmed to the most recent rows. Best-effort; never raises."""
+    try:
+        from datetime import datetime
+        _ensure_dirs()
+        chans = channels if isinstance(channels, str) else ",".join(str(c) for c in (channels or []))
+        cells = [
+            datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+            action or "", event or "", severity or "", (area or "")[:120], chans, note or "",
+        ]
+        line = ",".join('"' + str(c).replace('"', "'") + '"' for c in cells) + "\n"
+        header = "timestamp,action,event,severity,area,channels,note\n"
+        with _eas_log_lock:
+            new_file = not os.path.exists(_EAS_LOG_FILE)
+            with open(_EAS_LOG_FILE, "a", encoding="utf-8") as f:
+                if new_file:
+                    f.write(header)
+                f.write(line)
+            try:
+                with open(_EAS_LOG_FILE, encoding="utf-8") as f:
+                    rows = f.readlines()
+                if len(rows) > _EAS_LOG_MAX_ROWS + 1:
+                    with open(_EAS_LOG_FILE, "w", encoding="utf-8") as f:
+                        f.write(rows[0])
+                        f.writelines(rows[-_EAS_LOG_MAX_ROWS:])
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"[EmergencyAlertarr] FCC log write failed: {e}")
+
+
+def _eas_notify(kind, text):
+    """Fire-and-forget push to a configured Discord / ntfy / generic webhook when
+    an alert fires ('fire') or clears ('clear'). Runs in a background thread so a
+    slow endpoint can't stall an alert; failures are logged, never raised."""
+    try:
+        settings = _get_settings()
+    except Exception:
+        return
+    if str(settings.get("eas_notify_enabled")).strip().lower() not in ("true", "1", "yes", "on"):
+        return
+    url = (settings.get("eas_webhook_url") or "").strip()
+    if not url:
+        return
+    which = (settings.get("eas_notify_events") or "both").strip().lower()
+    if (which == "fire" and kind != "fire") or (which == "clear" and kind != "clear"):
+        return
+
+    def _send():
+        try:
+            import urllib.request
+            u = url.lower()
+            if "discord.com/api/webhooks" in u or "discordapp.com/api/webhooks" in u:
+                body = json.dumps({"content": text[:1900]}).encode("utf-8")
+                req = urllib.request.Request(url, data=body,
+                                             headers={"Content-Type": "application/json"})
+            elif "ntfy" in u:
+                req = urllib.request.Request(
+                    url, data=text.encode("utf-8"),
+                    headers={"Title": "EmergencyAlertarr",
+                             "Priority": "urgent" if kind == "fire" else "default",
+                             "Content-Type": "text/plain"})
+            else:
+                body = json.dumps({"text": text}).encode("utf-8")
+                req = urllib.request.Request(url, data=body,
+                                             headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=8).read(200)
+        except Exception as e:
+            logger.warning(f"[EmergencyAlertarr] webhook notify failed: {e}")
+
+    try:
+        threading.Thread(target=_send, daemon=True).start()
+    except Exception:
+        _send()
+
+
 def _eas_history_read():
     """Return the recent-alert history as a list (most recent first). Prefers
     Redis, falls back to the on-disk JSON file so history survives restarts
@@ -1391,6 +1479,13 @@ def _eas_history_add(event, area, channels, kind="alert", severity=""):
             "severity": severity or "",
         }
         hist = _eas_history_read()
+        _chan_list = channels if isinstance(channels, list) else [channels]
+        # FCC-style log: record every fire action (per channel).
+        _eas_log_event(
+            {"alert": "FIRED", "test": "TEST", "manual": "INJECT"}.get(kind, kind.upper()),
+            event=event or "Alert", severity=severity or "", area=area or "",
+            channels=", ".join(str(c) for c in _chan_list),
+        )
         # Light dedup: collapse an identical event+kind fired within 5s (e.g.
         # the same alert hitting several channels in one sweep) into one entry
         # with the channel list merged, rather than spamming the log.
@@ -1413,6 +1508,12 @@ def _eas_history_add(event, area, channels, kind="alert", severity=""):
         hist.insert(0, entry)
         hist = hist[:_EAS_HISTORY_MAX]
         _eas_history_write(hist)
+        # Notify once per new alert (merged repeats above already returned).
+        _label = {"alert": "EAS Alert", "test": "EAS Test", "manual": "EAS (manual)"}.get(kind, "EAS")
+        _sev = f" [{severity}]" if severity else ""
+        _eas_notify("fire", f"\U0001F6A8 {_label}: {event or 'Alert'}{_sev}"
+                    + (f" — {area}" if area else "")
+                    + f" — on {', '.join(str(c) for c in _chan_list)}")
     except Exception as e:
         logger.warning(f"[EmergencyAlertarr] EAS: failed to record history: {e}")
 
@@ -1506,7 +1607,11 @@ def _eas_do_restore(cid, mapping, mappings):
     mappings[cid] = mapping
     _eas_clear(cid)
     with _eas_lock:
+        _ev = _eas_active.get(cid, "")
         _eas_active.pop(cid, None)
+    _cname = channel.name if channel else str(cid)
+    _eas_log_event("RESTORED", event=_ev or "", channels=_cname, note="alert cleared")
+    _eas_notify("clear", f"\u2705 EAS cleared" + (f": {_ev}" if _ev else "") + f" — on {_cname}")
     logger.info(f"[EmergencyAlertarr] EAS: sequence complete, restored ch {cid}")
 
 def _eas_process_restores(mappings, streaming_ids, now_ts):
@@ -2035,7 +2140,8 @@ def _eas_fire_scheduled_test():
     use_tts        = bool(settings.get("eas_tts_enabled", True))
     mode = (settings.get("eas_test_schedule") or "off").lower()
     test_area = (settings.get("eas_test_area") or "").strip() or None
-    endec_test = bool(settings.get("eas_endec_test_mode", True))
+    # Scheduled RMT plays the full sequence; only scheduled RWT is tones-only ENDEC.
+    endec_test = (mode == "weekly")   # RWT = tones-only ENDEC; RMT = full readout
     generate_tones = bool(settings.get("eas_generate_tones", False))
     try:
         att_secs = max(4.0, min(30.0, float(settings.get("eas_att_secs") or 8)))
@@ -2445,6 +2551,19 @@ class Plugin:
              "label": "Overlay lead-in: seconds of silence held before the alert tones start, so the on-screen overlay has time to appear first. The overlay is drawn on the live channel, which can take a few seconds to reconnect after switching to the alert, while the tones are instant — without a lead-in the header tones play over a blank picture. Set this roughly to how long your channels take to come back after a switch (4 is a good start; lower it if your streams reconnect fast, raise it if the tones still beat the picture)."},
             {"id": "eas_lead_in_secs", "type": "number", "label": "Overlay Lead-in (seconds before tones, default 4)", "min": 0, "max": 15},
 
+            # 3b - Notifications & logging
+            {"id": "_eas_notify_header", "type": "info", "label": "──────  NOTIFICATIONS & LOG  ──────"},
+            {"id": "_eas_notify_note", "type": "info",
+             "label": "Push a message to Discord, ntfy, or any webhook when an alert fires and when it clears. Paste a Discord webhook URL, an ntfy topic URL (https://ntfy.sh/your-topic), or any endpoint that accepts a JSON POST. Every alert action is also written to an FCC-style CSV log at emergencyalertarr_data/eas_fcc_log.csv (timestamp, action, event, severity, area, channels) whether or not notifications are on."},
+            {"id": "eas_notify_enabled", "type": "boolean", "label": "Send webhook notifications"},
+            {"id": "eas_webhook_url", "type": "text", "label": "Webhook URL (Discord / ntfy / generic JSON)", "placeholder": "https://discord.com/api/webhooks/... or https://ntfy.sh/my-eas"},
+            {"id": "eas_notify_events", "type": "select", "label": "Notify on",
+             "options": [
+                 {"value": "both",  "label": "Both fire and clear"},
+                 {"value": "fire",  "label": "Only when an alert fires"},
+                 {"value": "clear", "label": "Only when an alert clears"},
+             ]},
+
             # 4 - Alert audio
             {"id": "_eas_audio_header", "type": "info", "label": "──────  4 · ALERT AUDIO  ──────"},
             {"id": "_eas_gentone_note", "type": "info",
@@ -2466,10 +2585,6 @@ class Plugin:
                  {"value": "weekly",  "label": "RWT — Required Weekly Test"},
              ]},
             {"id": "eas_test_area", "type": "text", "label": "Test Announce Area (optional — blank says \"this viewing area\")", "placeholder": "e.g. Tulsa County, Oklahoma"},
-            {"id": "_eas_endec_note", "type": "info",
-             "label": "ENDEC test sequence (tests only): plays like a real ENDEC self-test — header tones, EOM tones, then a silent tail with the screen still up — no attention tone or readout. Affects tests only; real alerts always use the full header → attention → readout → EOM sequence."},
-            {"id": "eas_endec_test_mode", "type": "boolean", "label": "Use ENDEC-style test sequence (header → EOM → silent tail). ON by default."},
-            {"id": "eas_endec_tail_secs", "type": "number", "label": "ENDEC silent-tail length (seconds the screen lingers after EOM, default 7.5)", "min": 1, "max": 30},
             {"id": "_eas_sched_note", "type": "info",
              "label": "Scheduled auto-test: fire an RWT or RMT automatically on a schedule, like a station's automated encoder. Only fires on channels that currently have a viewer."},
             {"id": "eas_test_schedule", "type": "select", "label": "Auto-Test Schedule",
@@ -2764,7 +2879,10 @@ class Plugin:
                 use_tts        = bool(settings.get("eas_tts_enabled", True))
                 test_type      = (settings.get("eas_test_type") or "monthly").lower()
                 test_area      = (settings.get("eas_test_area") or "").strip() or None
-                endec_test     = bool(settings.get("eas_endec_test_mode", True))
+                # RMT (monthly) always plays the full sequence -- attention tone +
+                # spoken readout. Only RWT (weekly) uses the tones-only ENDEC test
+                # (header -> EOM), and only when the ENDEC toggle is on.
+                endec_test     = (test_type == "weekly")   # RWT = tones-only ENDEC; RMT = full readout
                 generate_tones = bool(settings.get("eas_generate_tones", False))
                 try:
                     att_secs   = max(4.0, min(30.0, float(settings.get("eas_att_secs") or 8)))
