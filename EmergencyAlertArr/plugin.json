@@ -1,6 +1,6 @@
 {
   "name": "EmergencyAlertarr",
-  "version": "0.5.00",
+  "version": "0.6.00",
   "logo": "logo.png",
   "description": "Emergency Alert System overlays (NWS + FEMA IPAWS) for IPTV channels",
   "author": "sds8910",
