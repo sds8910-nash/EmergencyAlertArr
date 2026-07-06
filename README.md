@@ -20,6 +20,12 @@ like real cable during a weather warning, that's the idea.
 Alerts play one at a time. Nothing fires on channels nobody's tuned to, and everything self-restores
 even if the viewer wanders off mid-alert.
 
+## Requirements
+- Dispatcharr, obviously.
+-  - espeak-ng in the Dispatcharr container if you want the spoken readout (apt-get install espeak-ng). Without it, alerts just use a silent gap instead
+-  — everything else still works.
+-  - FFmpeg with libx264 (Dispatcharr already has this).
+
 ## Overlay styles
 
 <table>
