@@ -22,29 +22,51 @@ even if the viewer wanders off mid-alert.
 
 ## Overlay styles
 
-Four looks, set under **On-Screen Look**:
+<table>
+<tr>
+<td align="center" width="50%">
 
-- **EASyPlus** — full-screen black takeover with centered white text and a scrolling line. The
-  classic broadcast character-generator look.
-- **DASDEC** — full-screen navy screen with a red border and centered monospace text, worded like a
-  real ENDEC ("... has issued ... for the following counties or areas ..."), paginated for long alerts.
-- **EASyPlus Ticker** — crawl only. A black bar in the upper-middle with slow white scrolling text;
-  the program keeps playing underneath.
-- **DASDEC Scroll** — crawl only. A gray two-row bar: "Emergency Alert Message" on top, scrolling
-  details below. The program stays visible.
+<strong>EASyPlus</strong><br><br>
 
-The two takeover styles replace the picture; the two crawl styles leave it running with just a bar
-on top. Either way the tones still play.
+<img src="docs/images/easyplus-full.png" alt="EASyPlus full-screen overlay" width="350"><br><br>
 
-## Requirements
+Full-screen black takeover with centered white text and a scrolling line.
 
-- Dispatcharr, obviously.
-- `espeak-ng` in the Dispatcharr container if you want the spoken readout
-  (`apt-get install espeak-ng`). Without it, alerts just use a silent gap instead — everything else
-  still works.
-- FFmpeg with libx264 (Dispatcharr already has this).
+</td>
 
-The overlay fonts and the tone sounds are already bundled, so there's nothing else to add.
+<td align="center" width="50%">
+
+<strong>DASDEC</strong><br><br>
+
+<img src="docs/images/dasdec-full.png" alt="DASDEC full-screen overlay" width="350"><br><br>
+
+Navy ENDEC-style screen with a red border and paginated alert text.
+
+</td>
+</tr>
+
+<tr>
+<td align="center">
+
+<strong>EASyPlus Ticker</strong><br><br>
+
+<img src="docs/images/easyplus-ticker.png" alt="EASyPlus ticker overlay" width="350"><br><br>
+
+Program continues playing underneath with a scrolling alert banner.
+
+</td>
+
+<td align="center">
+
+<strong>DASDEC Scroll</strong><br><br>
+
+<img src="docs/images/dasdec-scroll.png" alt="DASDEC scrolling overlay" width="350"><br><br>
+
+Gray two-row ENDEC-style crawl while the program remains visible.
+
+</td>
+</tr>
+</table>
 
 ## Install
 
