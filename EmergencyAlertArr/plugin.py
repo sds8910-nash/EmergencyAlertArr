@@ -812,7 +812,8 @@ def _clone_and_inject_eas(channel_id, original_profile, channel_name="", silence
                           transcode_mode="full", style="easyplus", unique_alerts=None,
                           use_tts=True, endec_test=False, tail_secs=7.5,
                           generate_tones=False, att_secs=8.0,
-                          easyplus_font=None, easyplus_scale=1.0, lead_in_secs=0.0):
+                          easyplus_font=None, easyplus_scale=1.0, lead_in_secs=0.0,
+                          relay_message_wav=None, relay_message_secs=0.0):
     """Clone the channel's profile into an EAS-overlay profile.
 
     Returns (profile, removed_flags, total_duration). total_duration is the
@@ -838,10 +839,19 @@ def _clone_and_inject_eas(channel_id, original_profile, channel_name="", silence
     # no every-county pile-up) even if something upstream regresses.
     unique_alerts = list(unique_alerts or [])[:1]
 
-    # --- Decide the middle audio segment (TTS readout vs plain silence) ------
+    # --- Decide the middle audio segment (relay message vs TTS readout vs silence)
     mid_path = None
     mid_secs = silence_secs
-    if not endec_test and use_tts and _TTS_BIN and unique_alerts:
+    if relay_message_wav and os.path.exists(relay_message_wav) and not endec_test:
+        # ENDEC relay mode: air the REAL captured message audio between the
+        # (regenerated) attention tone and EOM, exactly like a real ENDEC
+        # forwarding the received message. No TTS.
+        mid_path = relay_message_wav
+        try:
+            mid_secs = (float(relay_message_secs) or _wav_duration_secs(relay_message_wav)) + 1.0
+        except Exception:
+            mid_secs = _wav_duration_secs(relay_message_wav) + 1.0
+    elif not endec_test and use_tts and _TTS_BIN and unique_alerts:
         texts = _eas_alert_texts(unique_alerts)
         spoken = texts.get("spoken", "") or ""
         if len(spoken) > _EAS_MAX_SPOKEN_CHARS:
@@ -2054,6 +2064,10 @@ def _eas_sweep_loop(stop_event):
             except Exception:
                 pass
             _eas_sweep()
+            try:
+                _eas_ensure_monitor(_get_settings())   # start/stop live SAME monitor
+            except Exception as _me:
+                logger.error(f"[EmergencyAlertarr] monitor manage error: {_me}", exc_info=True)
         except Exception as e:
             logger.error(f"[EmergencyAlertarr] EAS loop error: {e}", exc_info=True)
         finally:
@@ -2427,6 +2441,161 @@ def _poll_loop(stop_event):
     eas_t.join()
     sched_t.join()
 
+# --- SAME stream monitor (live PEP/LP input) + decoded-alert relay ----------
+_stream_monitor = {"mon": None, "url": None}
+
+
+def _eas_area_match_decoded(alert, settings):
+    """True if a decoded SAME alert should relay here: national, or its FIPS codes
+    match the monitored codes (falls back to the IPAWS codes; ALL/unset relays
+    everything heard, since the monitored station is already area-specific)."""
+    try:
+        from eaa_sources import _same_codes_match, _is_national_alert
+    except Exception:
+        return True
+    if _is_national_alert(alert):
+        return True
+    raw = (settings.get("eas_monitor_codes") or settings.get("eas_ipaws_same_codes") or "").strip()
+    if not raw or raw.upper() == "ALL":
+        return True
+    codes = [c.strip() for c in raw.replace(" ", "").split(",") if c.strip()]
+    return _same_codes_match(alert.get("same_codes") or [], codes)
+
+
+def _eas_relay_decoded(info):
+    """Relay a SAME activation decoded off the monitored stream: air it on watched
+    armed channels with the captured message spliced between a regenerated
+    header/attention and EOM -- like a real ENDEC forwarding a received alert."""
+    settings = _get_settings()
+    alert = info.get("alert")
+    if not alert:
+        return
+    if not _eas_area_match_decoded(alert, settings):
+        logger.info(f"[EmergencyAlertarr] relay: {alert.get('event')} not for our area -- ignoring")
+        return
+    from apps.channels.models import Channel
+    from core.models import StreamProfile
+    mappings = _get_mappings()
+    streaming_ids = _eas_streaming_ids()
+    overlay_style  = (settings.get("eas_overlay_style") or "easyplus").lower()
+    transcode_mode = settings.get("eas_transcode_mode") or "full"
+    try:
+        att_secs = max(4.0, min(30.0, float(settings.get("eas_att_secs") or 8)))
+    except Exception:
+        att_secs = 8.0
+    lead_in = float(settings.get("eas_lead_in_secs") or 0)
+    _ep_font, _ep_scale = _easyplus_settings(settings)
+    msg_wav  = info.get("message_wav")
+    msg_secs = info.get("msg_secs") or 0.0
+    now_ts = time.time()
+    fired = []
+    for cid, mapping in list(mappings.items()):
+        if not mapping or (mapping.get("type") != "eas" and not mapping.get("eas_armed")):
+            continue
+        if cid not in streaming_ids or mapping.get("eas_profile_id"):
+            continue
+        if not mapping.get("original_profile_id"):
+            continue
+        orig = StreamProfile.objects.filter(id=mapping.get("original_profile_id")).first()
+        channel = Channel.objects.filter(id=int(cid)).first()
+        if not orig or not channel:
+            continue
+        try:
+            eas_profile, _, seq = _clone_and_inject_eas(
+                channel.id, orig, channel.name, transcode_mode=transcode_mode,
+                style=overlay_style, unique_alerts=[alert], use_tts=False,
+                generate_tones=True, att_secs=att_secs,
+                easyplus_font=_ep_font, easyplus_scale=_ep_scale, lead_in_secs=lead_in,
+                relay_message_wav=msg_wav, relay_message_secs=msg_secs,
+            )
+            _assign_profile(channel, eas_profile)
+            _eas_write_alert(cid, [alert], style=overlay_style)
+            mapping["eas_profile_id"] = eas_profile.id
+            _eas_arm_restore(mapping, seq, now_ts)
+            mappings[cid] = mapping
+            _restart_channel_stream_async(channel, label="EAS-relay", proactive=True)
+            with _eas_lock:
+                _eas_active[cid] = alert.get("event") or "EAS"
+            fired.append(channel.name)
+        except Exception as e:
+            logger.error(f"[EmergencyAlertarr] relay fire failed ch {cid}: {e}", exc_info=True)
+    if fired:
+        _save_mappings(mappings)
+        _eas_history_add(alert.get("event") or "Relay", alert.get("area") or "",
+                         fired, kind="alert", severity=alert.get("severity") or "")
+        _eas_log_event("RELAYED", event=alert.get("event") or "", severity=alert.get("severity") or "",
+                       area=alert.get("area") or "", channels=", ".join(fired),
+                       note=f"SAME relay: {info.get('header','')[:48]}")
+        _eas_notify("fire", f"\U0001F4E1 EAS relay: {alert.get('event')}"
+                    + (f" — on {', '.join(fired)}"))
+        logger.info(f"[EmergencyAlertarr] relayed {alert.get('event')} on {', '.join(fired)}")
+    else:
+        logger.info("[EmergencyAlertarr] relay: no watched armed channels to air on")
+
+
+def _eas_on_activation(info):
+    """StreamMonitor callback (runs in the monitor thread)."""
+    try:
+        from django.db import close_old_connections
+        close_old_connections()
+    except Exception:
+        pass
+    try:
+        _eas_relay_decoded(info)
+    except Exception as e:
+        logger.error(f"[EmergencyAlertarr] relay callback error: {e}", exc_info=True)
+
+
+def _eas_ensure_monitor(settings):
+    """Start/stop the live SAME stream monitor to match settings. Gated by a Redis
+    ownership lock so only one worker runs it (one ffmpeg pull, no double-relay)."""
+    url = (settings.get("eas_monitor_url") or "").strip()
+    enabled = str(settings.get("eas_monitor_enabled")).strip().lower() in ("true", "1", "yes", "on")
+    rc = _get_redis_client()
+    own = True
+    if enabled and url and rc:
+        key = "emergencyalertarr:monitor_owner"
+        me = str(os.getpid())
+        try:
+            cur = rc.get(key)
+            cur = cur.decode() if isinstance(cur, bytes) else cur
+            if cur is None:
+                own = bool(rc.set(key, me, nx=True, ex=180))
+            elif cur == me:
+                rc.expire(key, 180)
+                own = True
+            else:
+                own = False
+        except Exception:
+            own = True
+    cur_mon = _stream_monitor["mon"]
+    if enabled and url and own:
+        if cur_mon is None or _stream_monitor["url"] != url:
+            if cur_mon is not None:
+                try:
+                    cur_mon.stop()
+                except Exception:
+                    pass
+            try:
+                from eaa_decoder import StreamMonitor
+                mon = StreamMonitor(url, _eas_on_activation,
+                                    out_dir=os.path.join(_DATA_DIR, "captures"), logger=logger)
+                mon.start()
+                _stream_monitor["mon"] = mon
+                _stream_monitor["url"] = url
+                logger.info(f"[EmergencyAlertarr] SAME stream monitor started: {url}")
+            except Exception as e:
+                logger.error(f"[EmergencyAlertarr] could not start stream monitor: {e}", exc_info=True)
+    elif cur_mon is not None:
+        try:
+            cur_mon.stop()
+        except Exception:
+            pass
+        _stream_monitor["mon"] = None
+        _stream_monitor["url"] = None
+        logger.info("[EmergencyAlertarr] SAME stream monitor stopped")
+
+
 class Plugin:
     @property
     def fields(self):
@@ -2519,6 +2688,14 @@ class Plugin:
             {"id": "eas_event_allow", "type": "text", "label": "Only these event codes (optional allow-list, e.g. TOR,SVR,FFW)", "placeholder": "blank = allow all EAS events"},
             {"id": "eas_event_block", "type": "text", "label": "Never these event codes (optional block-list)", "placeholder": "e.g. SVR,SPS"},
             {"id": "eas_poll_interval",   "type": "number", "label": "How often to check for alerts (seconds, min 15, default 60)", "min": 15},
+
+            # 1b - Monitored input (live SAME decode)
+            {"id": "_eas_monitor_header", "type": "info", "label": "──────  MONITORED INPUT (SAME decode)  ──────"},
+            {"id": "_eas_monitor_note", "type": "info",
+             "label": "Monitor a live audio stream (your PEP/LP station's web stream) like a real ENDEC: it decodes the SAME header off the audio, captures the message, and relays the alert on your watched channels with the real received audio (regenerated header/attention + captured message + regenerated EOM). Paste a direct stream URL (Icecast/HLS/etc. that ffmpeg can open). Runs on one worker; test with recorded activations first using the eaa_decoder.py CLI."},
+            {"id": "eas_monitor_enabled", "type": "boolean", "label": "Monitor a live stream for SAME activations"},
+            {"id": "eas_monitor_url", "type": "text", "label": "Monitored stream URL (PEP/LP station audio)", "placeholder": "https://example.com/stream.mp3"},
+            {"id": "eas_monitor_codes", "type": "text", "label": "Relay only these SAME codes (optional; blank = relay everything heard). National always relays.", "placeholder": "e.g. 040143,040131"},
 
             # 2 - On-screen look
             {"id": "_eas_ovl_header", "type": "info", "label": "──────  2 · ON-SCREEN LOOK  ──────"},
