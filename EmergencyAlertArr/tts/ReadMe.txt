@@ -1,0 +1,1 @@
+Put your piper TTS model and Json in this folder
