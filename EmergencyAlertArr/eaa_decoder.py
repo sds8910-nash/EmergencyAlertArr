@@ -475,10 +475,12 @@ class StreamMonitor:
                 self.log.error(f"[stream-monitor] cannot start ffmpeg: {e}")
                 return
             self.log.info(f"[stream-monitor] listening to {self.url}")
+            got_bytes = 0
             while not self._stop.is_set():
                 data = self._proc.stdout.read(chunk)
                 if not data:
                     break
+                got_bytes += len(data)
                 pcm = np.frombuffer(data, dtype="<i2").astype(np.float32) / 32768.0
                 try:
                     self.feed(pcm)
@@ -490,8 +492,15 @@ class StreamMonitor:
                 pass
             if self._stop.is_set():
                 break
-            self.log.warning("[stream-monitor] stream ended/dropped; reconnecting in 5s")
-            self._stop.wait(5)
+            if got_bytes < self.sr:   # < ~0.5s of audio before it ended -> bad URL
+                self.log.error(
+                    "[stream-monitor] no audio from the URL. It must be a DIRECT audio stream "
+                    "(Icecast/HLS/mp3 that ffmpeg can open), not a web player page. "
+                    "Reconnecting in 15s.")
+                self._stop.wait(15)
+            else:
+                self.log.warning("[stream-monitor] stream ended/dropped; reconnecting in 5s")
+                self._stop.wait(5)
 
     # -- detect/capture core (testable) --------------------------------------
     def feed(self, pcm):
