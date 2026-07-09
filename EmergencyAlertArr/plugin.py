@@ -27,13 +27,19 @@ def _easyplus_settings(settings):
         scale = 1.0
     return font, scale
 
-_TTS_BIN = shutil.which("espeak-ng") or shutil.which("espeak")
+# TTS engines, best-sounding first. Piper is a neural TTS that sounds close to a
+# real ENDEC voice; pico2wave (svox) is a clearer classic voice; espeak-ng is the
+# robotic fallback. All run fully offline.
+_TTS_PIPER  = shutil.which("piper") or shutil.which("piper-tts")
+_TTS_PICO   = shutil.which("pico2wave")
+_TTS_ESPEAK = shutil.which("espeak-ng") or shutil.which("espeak")
+_TTS_BIN    = _TTS_PIPER or _TTS_PICO or _TTS_ESPEAK   # "is any TTS available?"
 
 if not _TTS_BIN:
     logger.warning(
-        "emergencyalertarr: no TTS engine found (espeak-ng/espeak) -- EAS alerts will "
-        "use silence instead of a spoken readout. Install espeak-ng in the "
-        "Dispatcharr container to enable this."
+        "emergencyalertarr: no TTS engine found -- EAS alerts will use silence "
+        "instead of a spoken readout. For a natural ENDEC-style voice install "
+        "Piper (recommended) or pico2wave; espeak-ng also works (robotic)."
     )
 
 _TTS_DIRECTIONS = {
@@ -150,23 +156,72 @@ def _tts_normalize(text):
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
+def _tts_piper_model(settings):
+    """Locate a Piper voice model (.onnx): the configured path first, then a
+    bundled tts/ folder in the plugin dir or data dir."""
+    m = (settings.get("eas_tts_model") or "").strip()
+    if m and os.path.isfile(m):
+        return m
+    for d in (os.path.join(_PLUGIN_DIR, "tts"), os.path.join(_DATA_DIR, "tts")):
+        if os.path.isdir(d):
+            for fn in sorted(os.listdir(d)):
+                if fn.endswith(".onnx"):
+                    return os.path.join(d, fn)
+    return None
+
+
 def _eas_tts_synthesize(text, out_path):
-    """Synthesize text to a WAV file with espeak-ng/espeak. Fully offline.
-    Returns True on success, False if no TTS engine is installed, the text
-    is empty, or synthesis fails for any reason (caller falls back to silence)."""
-    if not _TTS_BIN or not text:
+    """Synthesize text to a WAV file, offline, using the best available voice.
+    Engine preference (setting eas_tts_engine, default auto): Piper (neural,
+    natural) -> pico2wave (svox) -> espeak-ng (robotic). Returns True on success,
+    False if nothing worked (caller falls back to silence)."""
+    if not text:
         return False
+    try:
+        settings = _get_settings()
+    except Exception:
+        settings = {}
+    engine = (settings.get("eas_tts_engine") or "auto").strip().lower()
     spoken = _tts_normalize(text)
     try:
         _ensure_dirs()
-        result = subprocess.run(
-            [_TTS_BIN, "-v", "en-us", "-s", "165", "-w", out_path, spoken],
-            timeout=20, capture_output=True,
-        )
-        return result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 200
-    except Exception as e:
-        logger.warning(f"[EmergencyAlertarr] EAS: TTS synthesis failed: {e}")
-        return False
+    except Exception:
+        pass
+
+    def _run(cmd, stdin=None):
+        try:
+            r = subprocess.run(cmd, input=stdin, timeout=45, capture_output=True)
+            return (r.returncode == 0 and os.path.exists(out_path)
+                    and os.path.getsize(out_path) > 200)
+        except Exception as e:
+            logger.warning(f"[EmergencyAlertarr] EAS: TTS ({os.path.basename(cmd[0])}) failed: {e}")
+            return False
+
+    # 1) Piper -- neural, most natural (needs a .onnx voice model) ------------
+    if engine in ("auto", "piper") and _TTS_PIPER:
+        model = _tts_piper_model(settings)
+        if model:
+            if _run([_TTS_PIPER, "--model", model, "--output_file", out_path],
+                    stdin=spoken.encode("utf-8")):
+                return True
+            if engine == "piper":
+                logger.warning("[EmergencyAlertarr] Piper failed; falling back to another engine")
+        elif engine == "piper":
+            logger.warning("[EmergencyAlertarr] Piper selected but no .onnx voice model found "
+                           "(set eas_tts_model, or drop a model in the plugin's tts/ folder)")
+
+    # 2) pico2wave (svox) -- clearer classic voice ----------------------------
+    if engine in ("auto", "pico") and _TTS_PICO:
+        voice = (settings.get("eas_tts_voice") or "en-US").strip() or "en-US"
+        if _run([_TTS_PICO, "-l", voice, "-w", out_path, spoken]):
+            return True
+
+    # 3) espeak-ng -- robotic fallback ----------------------------------------
+    if _TTS_ESPEAK:
+        voice = ((settings.get("eas_tts_voice") or "en-us").strip() or "en-us").lower()
+        if _run([_TTS_ESPEAK, "-v", voice, "-s", "165", "-w", out_path, spoken]):
+            return True
+    return False
 
 def _build_eas_easyplus_filter(channel_id, total_duration=60, font=None, scale=1.0):
     """Classic EASyPlus-style EAS takeover: full-screen black background with
@@ -2770,8 +2825,17 @@ class Plugin:
             {"id": "eas_generate_tones", "type": "boolean", "label": "Generate EAS tones automatically (no WAV files needed)"},
             {"id": "eas_att_secs", "type": "number", "label": "Attention Tone length (seconds — only when tones are generated; broadcast EAS uses 8, real range 8–25)", "min": 4, "max": 30},
             {"id": "_eas_tts_note", "type": "info",
-             "label": "Spoken readout (TTS): reads the alert aloud (offline, via espeak-ng) in the gap between the attention and EOM tones instead of dead air. Needs espeak-ng in the Dispatcharr container (apt-get install espeak-ng); if it's missing, alerts fall back to the silent gap below automatically."},
+             "label": "Spoken readout (TTS): reads the alert aloud (offline) in the gap between the attention and EOM tones. For a natural, real-ENDEC-sounding voice install Piper — a neural TTS — and point it at a voice model; pico2wave (svox) is a clearer classic voice; espeak-ng is the robotic fallback. If none are installed, alerts use the silent gap. Piper voices: download a .onnx model (e.g. en_US-lessac-medium or en_US-ryan-high from the piper-voices project), put it in the plugin's tts/ folder or set its path below."},
             {"id": "eas_tts_enabled", "type": "boolean", "label": "Read the alert aloud (TTS)"},
+            {"id": "eas_tts_engine", "type": "select", "label": "TTS Voice Engine",
+             "options": [
+                 {"value": "auto",   "label": "Auto — best installed (Piper › pico › espeak)"},
+                 {"value": "piper",  "label": "Piper — natural neural voice (recommended; needs a model)"},
+                 {"value": "pico",   "label": "pico2wave — clearer classic voice"},
+                 {"value": "espeak", "label": "espeak-ng — robotic (fallback)"},
+             ]},
+            {"id": "eas_tts_model", "type": "text", "label": "Piper voice model path (.onnx)", "placeholder": "e.g. /data/plugins/emergencyalertarr/tts/en_US-ryan-high.onnx"},
+            {"id": "eas_tts_voice", "type": "text", "label": "Voice/language for pico or espeak (optional)", "placeholder": "e.g. en-US"},
             {"id": "eas_silence_secs",  "type": "number", "label": "Silent gap length (seconds, 10–20) — used only when TTS is OFF/unavailable; when TTS is ON the gap is sized to the readout", "min": 10, "max": 20},
 
             # 5 - Tests
@@ -3490,7 +3554,14 @@ class Plugin:
                 dur = _wav_duration_secs(path)
                 flag = "✓" if sz >= 200 and dur > 0 else "✗ EMPTY/INVALID"
                 wav_lines.append(f"  {flag} {name}: {sz} bytes, {dur:.1f}s")
-        tts_state = f"TTS engine: {_TTS_BIN}" if _TTS_BIN else "TTS engine: NOT installed (espeak-ng) — alerts use silence"
+        if _TTS_PIPER:
+            tts_state = f"TTS engine: Piper (natural) — {_TTS_PIPER}"
+        elif _TTS_PICO:
+            tts_state = f"TTS engine: pico2wave — {_TTS_PICO}"
+        elif _TTS_ESPEAK:
+            tts_state = f"TTS engine: espeak-ng (robotic) — {_TTS_ESPEAK}"
+        else:
+            tts_state = "TTS engine: NOT installed — alerts use silence (install Piper for a natural voice)"
         wav_lines.append(tts_state)
         # List ChannelService methods so we can find the right proactive-restart
         # call (the channel-stop -> client-reconnect gap is what makes test
