@@ -2546,30 +2546,38 @@ def _eas_on_activation(info):
         logger.error(f"[EmergencyAlertarr] relay callback error: {e}", exc_info=True)
 
 
+_MONITOR_LEASE_KEY = "emergencyalertarr:monitor_owner"
+_MONITOR_LEASE_TTL = 150   # seconds; must exceed the poll interval
+
+
 def _eas_ensure_monitor(settings):
-    """Start/stop the live SAME stream monitor to match settings. Gated by a Redis
-    ownership lock so only one worker runs it (one ffmpeg pull, no double-relay)."""
+    """Start/stop the live SAME stream monitor to match settings. Exactly one
+    worker runs it, guarded by an atomic Redis lease. Fails CLOSED: if we can't
+    prove we hold the lease (no Redis, an error, or another worker owns it), we
+    do NOT start -- so a Redis hiccup during worker autoscaling can't spawn a
+    stampede of ffmpeg pulls."""
     url = (settings.get("eas_monitor_url") or "").strip()
     enabled = str(settings.get("eas_monitor_enabled")).strip().lower() in ("true", "1", "yes", "on")
     rc = _get_redis_client()
-    own = True
-    if enabled and url and rc:
-        key = "emergencyalertarr:monitor_owner"
-        me = str(os.getpid())
+    me = str(os.getpid())
+    want = enabled and bool(url)
+
+    own = False
+    if want and rc:
         try:
-            cur = rc.get(key)
-            cur = cur.decode() if isinstance(cur, bytes) else cur
-            if cur is None:
-                own = bool(rc.set(key, me, nx=True, ex=180))
-            elif cur == me:
-                rc.expire(key, 180)
-                own = True
+            if rc.set(_MONITOR_LEASE_KEY, me, nx=True, ex=_MONITOR_LEASE_TTL):
+                own = True                      # acquired a free lease
             else:
-                own = False
+                cur = rc.get(_MONITOR_LEASE_KEY)
+                cur = cur.decode() if isinstance(cur, bytes) else cur
+                if cur == me:
+                    rc.set(_MONITOR_LEASE_KEY, me, ex=_MONITOR_LEASE_TTL)  # refresh our lease
+                    own = True
         except Exception:
-            own = True
+            own = False                          # fail closed
+
     cur_mon = _stream_monitor["mon"]
-    if enabled and url and own:
+    if want and own:
         if cur_mon is None or _stream_monitor["url"] != url:
             if cur_mon is not None:
                 try:
@@ -2583,17 +2591,31 @@ def _eas_ensure_monitor(settings):
                 mon.start()
                 _stream_monitor["mon"] = mon
                 _stream_monitor["url"] = url
-                logger.info(f"[EmergencyAlertarr] SAME stream monitor started: {url}")
+                logger.info(f"[EmergencyAlertarr] SAME stream monitor started (owner pid {me}): {url}")
             except Exception as e:
                 logger.error(f"[EmergencyAlertarr] could not start stream monitor: {e}", exc_info=True)
-    elif cur_mon is not None:
-        try:
-            cur_mon.stop()
-        except Exception:
-            pass
-        _stream_monitor["mon"] = None
-        _stream_monitor["url"] = None
-        logger.info("[EmergencyAlertarr] SAME stream monitor stopped")
+    else:
+        if cur_mon is not None:
+            try:
+                cur_mon.stop()
+            except Exception:
+                pass
+            _stream_monitor["mon"] = None
+            _stream_monitor["url"] = None
+            # release our lease so another worker can take over promptly
+            if rc:
+                try:
+                    cur = rc.get(_MONITOR_LEASE_KEY)
+                    cur = cur.decode() if isinstance(cur, bytes) else cur
+                    if cur == me:
+                        rc.delete(_MONITOR_LEASE_KEY)
+                except Exception:
+                    pass
+            logger.info("[EmergencyAlertarr] SAME stream monitor stopped")
+        elif want and not rc:
+            # No Redis -> can't guarantee a single owner, so we don't start.
+            logger.warning("[EmergencyAlertarr] stream monitor needs Redis to guarantee a single "
+                           "owner across workers; not starting.")
 
 
 class Plugin:
