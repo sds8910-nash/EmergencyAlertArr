@@ -15,6 +15,14 @@ if _HERE not in _sys.path:
 from eaa_common import *
 from eaa_tones import *
 from eaa_sources import *
+from eaa_styles import (STYLE_CATALOG, STYLE_KEYS, build_style_overlay, eas_spoken_text,
+                        eas_test_alert, eas_event_code, style_is_live)
+from eaa_styles import eas_originator_code as _eas_org_code
+from eaa_filters import decide, can_preempt, classify as _eas_classify
+from eaa_templates import TEMPLATE_CHOICES
+from eaa_audio import render_alert_audio, AUDIO_CHANNEL_MODES, LOUDNESS_TARGETS
+from eaa_tts import (TTS_ENGINES, TTS_VOICES, TTS_FX, tts_synthesize, tts_status,
+                     tts_available, tts_cache_key)
 logger = logging.getLogger(__name__)
 
 
@@ -27,20 +35,8 @@ def _easyplus_settings(settings):
         scale = 1.0
     return font, scale
 
-# TTS engines, best-sounding first. Piper is a neural TTS that sounds close to a
-# real ENDEC voice; pico2wave (svox) is a clearer classic voice; espeak-ng is the
-# robotic fallback. All run fully offline.
-_TTS_PIPER  = shutil.which("piper") or shutil.which("piper-tts")
-_TTS_PICO   = shutil.which("pico2wave")
-_TTS_ESPEAK = shutil.which("espeak-ng") or shutil.which("espeak")
-_TTS_BIN    = _TTS_PIPER or _TTS_PICO or _TTS_ESPEAK   # "is any TTS available?"
-
-if not _TTS_BIN:
-    logger.warning(
-        "emergencyalertarr: no TTS engine found -- EAS alerts will use silence "
-        "instead of a spoken readout. For a natural ENDEC-style voice install "
-        "Piper (recommended) or pico2wave; espeak-ng also works (robotic)."
-    )
+# Kept for older call sites; real availability is checked per engine (eaa_tts).
+_TTS_BIN = shutil.which("espeak-ng") or shutil.which("espeak") or "flite"
 
 _TTS_DIRECTIONS = {
     "NNE": "north-northeast", "ENE": "east-northeast", "ESE": "east-southeast",
@@ -156,695 +152,318 @@ def _tts_normalize(text):
     s = re.sub(r"\s{2,}", " ", s).strip()
     return s
 
-def _tts_piper_model(settings):
-    """Locate a Piper voice model (.onnx): the configured path first, then a
-    bundled tts/ folder in the plugin dir or data dir."""
-    m = (settings.get("eas_tts_model") or "").strip()
-    if m and os.path.isfile(m):
-        return m
-    for d in (os.path.join(_PLUGIN_DIR, "tts"), os.path.join(_DATA_DIR, "tts")):
-        if os.path.isdir(d):
-            for fn in sorted(os.listdir(d)):
-                if fn.endswith(".onnx"):
-                    return os.path.join(d, fn)
-    return None
-
-
-def _eas_tts_synthesize(text, out_path):
-    """Synthesize text to a WAV file, offline, using the best available voice.
-    Engine preference (setting eas_tts_engine, default auto): Piper (neural,
-    natural) -> pico2wave (svox) -> espeak-ng (robotic). Returns True on success,
-    False if nothing worked (caller falls back to silence)."""
+def _eas_tts_synthesize(text, out_path, tts_opts=None):
+    """Synthesize the readout with the configured engine/voice/sound preset
+    (see eaa_tts). Returns True on success; callers fall back to silence."""
     if not text:
         return False
+    _ensure_dirs()
+    return tts_synthesize(_tts_normalize(text), out_path, tts_opts or {})
+
+def _eas_media_secs(path):
+    """Duration of any media file via ffprobe (0.0 if unknown)."""
     try:
-        settings = _get_settings()
+        r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                            "-of", "default=nw=1:nk=1", path], capture_output=True, text=True, timeout=20)
+        return float((r.stdout or "0").strip() or 0)
     except Exception:
-        settings = {}
-    engine = (settings.get("eas_tts_engine") or "auto").strip().lower()
-    spoken = _tts_normalize(text)
+        return 0.0
+
+def _eas_cap_audio_file(alert):
+    """WAV of the alert's own audio message (IPAWS CAP <resource> "EAS
+    Broadcast Content", embedded or by URL), converted and cached; None if the
+    alert has none or it can't be fetched. Capped at two minutes, like an
+    ENDEC's message store."""
+    import hashlib
+    src = alert.get("audio_file") or ""
+    url = alert.get("audio_url") or ""
+    if not (src and os.path.isfile(src)) and not url:
+        return None
+    _ensure_dirs()
+    key = hashlib.md5((src or url).encode("utf-8")).hexdigest()[:16]
+    out = os.path.join(RUNTIME_DIR, f"capaudio_{key}.wav")
+    if os.path.isfile(out) and os.path.getsize(out) > 1000:
+        return out
+    tmp = None
     try:
-        _ensure_dirs()
+        if not (src and os.path.isfile(src)):
+            if not url.lower().startswith(("http://", "https://")):
+                return None
+            req = urllib.request.Request(url, headers={"User-Agent": NWS_UA})
+            deadline = time.time() + 25
+            buf = bytearray()
+            with urllib.request.urlopen(req, timeout=10) as r:
+                while len(buf) <= 12 * 1024 * 1024:
+                    if time.time() > deadline:
+                        raise TimeoutError("audio download too slow")
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+            data = bytes(buf)
+            if len(data) > 12 * 1024 * 1024 or len(data) < 500:
+                return None
+            tmp = os.path.join(RUNTIME_DIR, f"capaudio_{key}.src")
+            with open(tmp, "wb") as f:
+                f.write(data)
+            src = tmp
+        ff = shutil.which("ffmpeg") or "ffmpeg"
+        r = subprocess.run([ff, "-v", "error", "-y", "-i", src, "-t", "120", "-vn", "-ac", "1",
+                            "-ar", "48000", "-c:a", "pcm_s16le", out],
+                           capture_output=True, timeout=60)
+        if r.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 1000:
+            return out
+    except Exception as e:
+        logger.warning(f"[EmergencyAlertarr] EAS: alert audio unavailable ({e}); using the voice instead")
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+    return None
+
+def _ffq(path):
+    """Quote a file path for use inside an FFmpeg filter argument (fontfile=,
+    textfile=). Single quotes make ':' ',' and spaces literal to the filter
+    parser; an embedded single quote is closed/escaped/reopened."""
+    return "'" + str(path).replace("'", "'\\''") + "'"
+
+def _eas_local_dt(dt):
+    """NWS/IPAWS timestamps carry the issuing office's local offset and are
+    shown as-is. UTC timestamps (tests, injected alerts, some CAP feeds) are
+    converted to the server's local time -- they used to be printed in UTC,
+    so a test at 8 PM CDT showed "1:00 AM"."""
+    try:
+        if dt.tzinfo is not None and dt.utcoffset().total_seconds() == 0:
+            return dt.astimezone()
     except Exception:
         pass
+    return dt
 
-    def _run(cmd, stdin=None):
-        try:
-            r = subprocess.run(cmd, input=stdin, timeout=45, capture_output=True)
-            return (r.returncode == 0 and os.path.exists(out_path)
-                    and os.path.getsize(out_path) > 200)
-        except Exception as e:
-            logger.warning(f"[EmergencyAlertarr] EAS: TTS ({os.path.basename(cmd[0])}) failed: {e}")
-            return False
+def _eas_audio_graph(first_idx, mid_path=None, mid_secs=15, endec_test=False, tail_secs=7.5,
+                     wav_header=None, wav_att=None, wav_eom=None, chain=None):
+    """FFmpeg inputs + filter graph for the EAS audio sequence, labelled [aseq].
 
-    # 1) Piper -- neural, most natural (needs a .onnx voice model) ------------
-    if engine in ("auto", "piper") and _TTS_PIPER:
-        model = _tts_piper_model(settings)
-        if model:
-            if _run([_TTS_PIPER, "--model", model, "--output_file", out_path],
-                    stdin=spoken.encode("utf-8")):
-                return True
-            if engine == "piper":
-                logger.warning("[EmergencyAlertarr] Piper failed; falling back to another engine")
-        elif engine == "piper":
-            logger.warning("[EmergencyAlertarr] Piper selected but no .onnx voice model found "
-                           "(set eas_tts_model, or drop a model in the plugin's tts/ folder)")
+    Returns (inputs, graph, description). `inputs` is the list of WAV paths to
+    add as -i inputs starting at input index `first_idx`.
 
-    # 2) pico2wave (svox) -- clearer classic voice ----------------------------
-    if engine in ("auto", "pico") and _TTS_PICO:
-        voice = (settings.get("eas_tts_voice") or "en-US").strip() or "en-US"
-        if _run([_TTS_PICO, "-l", voice, "-w", out_path, spoken]):
-            return True
+      * Normal:     header -> attention -> mid -> EOM
+                    mid = TTS readout WAV, or mid_secs of silence
+      * ENDEC test: header -> EOM -> tail_secs of silence
 
-    # 3) espeak-ng -- robotic fallback ----------------------------------------
-    if _TTS_ESPEAK:
-        voice = ((settings.get("eas_tts_voice") or "en-us").strip() or "en-us").lower()
-        if _run([_TTS_ESPEAK, "-v", voice, "-s", "165", "-w", out_path, spoken]):
-            return True
-    return False
-
-def _build_eas_easyplus_filter(channel_id, total_duration=60, font=None, scale=1.0):
-    """Classic EASyPlus-style EAS takeover: full-screen black background with
-    five stacked, centered white text lines. The area/effective-until line
-    crawls right-to-left in a single pass timed to finish exactly as
-    total_duration ends; the rest are static and centered.
-
-    font   -- overlay font file (defaults to the bundled EASyText.ttf).
-    scale  -- size multiplier applied to every line (1.0 = default size)."""
-    font = font or _font_for("easyplus")
-    if not font:
-        raise RuntimeError(
-            "No overlay font available. Ship fonts/EASyText.ttf and fonts/luximb.ttf "
-            "in the plugin zip, or install a TTF font package (e.g. fonts-dejavu-core) "
-            "in the Dispatcharr container."
-        )
-    d = RUNTIME_DIR
-    try:
-        scale = float(scale)
-    except Exception:
-        scale = 1.0
-    scale = max(0.5, min(3.0, scale))
-
-    def _sz(base):
-        return max(8, int(round(base * scale)))
-
-    # Larger defaults than before so the takeover reads like a real broadcast
-    # EAS character generator (the header roughly fills the screen width).
-    hdr_sz    = _sz(56)   # was 42
-    body_sz   = _sz(40)   # was 30
-    event_sz  = _sz(48)   # was 34
-
-    total_duration = max(5.0, float(total_duration))
-    scroll_x = f"w-t*((w+text_w+40)/{total_duration:.3f})"
-    return (
-        # Full-screen black takeover — completely replaces the underlying video
-        "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,"
-        f"drawtext=fontfile={font}"
-        f":textfile={d}/eas_{channel_id}_ep_header.txt:reload=1"
-        f":fontsize={hdr_sz}:fontcolor=white"
-        f":x=(w-text_w)/2:y=h*0.18,"
-        f"drawtext=fontfile={font}"
-        f":textfile={d}/eas_{channel_id}_ep_area.txt:reload=1"
-        f":fontsize={body_sz}:fontcolor=white"
-        f":x={scroll_x}:y=h*0.33,"
-        f"drawtext=fontfile={font}"
-        f":textfile={d}/eas_{channel_id}_ep_source.txt:reload=1"
-        f":fontsize={body_sz}:fontcolor=white"
-        f":x=(w-text_w)/2:y=h*0.47,"
-        f"drawtext=fontfile={font}"
-        f":textfile={d}/eas_{channel_id}_ep_issued.txt:reload=1"
-        f":fontsize={body_sz}:fontcolor=white"
-        f":x=(w-text_w)/2:y=h*0.60,"
-        f"drawtext=fontfile={font}"
-        f":textfile={d}/eas_{channel_id}_ep_event.txt:reload=1"
-        f":fontsize={event_sz}:fontcolor=white"
-        f":x=(w-text_w)/2:y=h*0.73"
-    )
-
-def _eas_dasdec_block_lines(unique_alerts, texts, width=40):
-    """Build the DASDEC/ENDEC message block as a list of centered text lines, in
-    the classic cable-headend wording:
-
-        <originator> has issued <a/an> <EVENT> for the following counties or
-        areas:
-        <Location>;
-        at <time>
-        on <DATE>
-        Effective until <time>.
-        Message from <station>.
-        <wrapped description text...>
-
-    Long lines are wrapped to `width` monospace characters so the paginator can
-    lay them out cleanly. This is the static, paginated headend look -- NOT a
-    scrolling crawl."""
-    import textwrap
-    from datetime import datetime
-    a = (unique_alerts or [{}])[0]
-    event = re.sub(r"\s+", " ", (a.get("event") or "Emergency Alert")).strip()
-    originator = (a.get("originator") or "").upper()
-    sender = (a.get("sender") or "").strip()
-    slow = sender.lower()
-
-    if originator == "PEP" or "primary entry" in slow:
-        orig_phrase = "The Primary Entry Point EAS System"
-    elif originator == "WXR" or "weather" in slow or "nws" in slow:
-        orig_phrase = "The National Weather Service"
-    elif originator == "CIV" or "civil" in slow or "law enforcement" in slow:
-        orig_phrase = "A civil authority"
-    elif originator == "EAS":
-        orig_phrase = "An EAS Participant"
-    else:
-        orig_phrase = sender or "The Emergency Alert System"
-
-    article = "an" if event[:1].upper() in "AEIOU" else "a"
-
-    def _fmt_time(iso):
-        try:
-            dt = datetime.fromisoformat((iso or "").strip().replace("Z", "+00:00"))
-            return dt.strftime("%I:%M %p").lstrip("0")
-        except Exception:
-            return ""
-
-    def _fmt_date(iso):
-        try:
-            dt = datetime.fromisoformat((iso or "").strip().replace("Z", "+00:00"))
-            return dt.strftime("%b %d, %Y").replace(" 0", " ").upper()
-        except Exception:
-            return ""
-
-    start_t = _fmt_time(a.get("effective"))
-    end_t   = _fmt_time(a.get("expires"))
-    date_s  = _fmt_date(a.get("effective"))
-    station = (sender or "EAS").strip()
-
-    lines = textwrap.wrap(
-        f"{orig_phrase} has issued {article} {event} for the following "
-        f"counties or areas:", width=width
-    )
-    areas = [x.strip() for x in (a.get("area") or "").split(";") if x.strip()]
-    for loc in (areas or ["This area"]):
-        for seg in textwrap.wrap(f"{loc};", width=width):
-            lines.append(seg)
-    if start_t:
-        lines.append(f"at {start_t}")
-    if date_s:
-        lines.append(f"on {date_s}")
-    if end_t:
-        lines.append(f"Effective until {end_t}.")
-    lines.append(f"Message from {station}.")
-
-    desc = (texts.get("body") or "").strip()
-    if desc and "no further details" not in desc.lower():
-        lines.append("")
-        for para in desc.split("\n"):
-            para = para.strip()
-            if not para:
-                lines.append("")
-                continue
-            lines.extend(textwrap.wrap(para, width=width))
-    return [ln for ln in lines if ln is not None]
-
-def _eas_dasdec_pages(channel_id, block_lines, total_duration, lines_per_page=11):
-    """Write each message line to its own file, split the block into pages, write
-    a "1/3" page-counter file per page, and return (page_line_map, page_secs)."""
-    for i, line in enumerate(block_lines):
-        _atomic_write(f"eas_{channel_id}_dd_l{i}.txt", line if line.strip() else " ")
-    page_line_map = []
-    total = max(1, len(block_lines))
-    for start in range(0, total, lines_per_page):
-        page_line_map.append(list(range(start, min(start + lines_per_page, total))))
-    if not page_line_map:
-        page_line_map = [[]]
-    n = len(page_line_map)
-    page_secs = max(5.0, float(total_duration) / n)
-    for pi in range(n):
-        _atomic_write(f"eas_{channel_id}_dd_pg{pi}.txt", f"{pi + 1}/{n}")
-    return page_line_map, page_secs
-
-def _build_eas_dasdec_filter(channel_id, page_line_map, page_secs, font=None):
-    """DASDEC / cable-headend EAS takeover: dark navy background, thin bright red
-    inset border, monospace bold white text, centered, auto-paginated with a
-    "1/3" page counter near the bottom. Rendered as a plain -vf drawtext chain
-    (per-page lines time-gated with enable='between(t,...)') -- the same reliable
-    path EASyPlus uses. No pre-render, no filter_complex, no movie= input."""
-    font = font or _font_for("dasdec")
-    if not font:
-        raise RuntimeError(
-            "No overlay font available. Ship fonts/luximb.ttf in the plugin zip, "
-            "or install a TTF font package (e.g. fonts-dejavu-core) in the container."
-        )
-    d = RUNTIME_DIR
-    navy = "0x0A1E5C"
-    red  = "0xC00000"
-    border_t = 16       # red frame thickness, flush to the screen edge
-    margin = 22
-    title_size = 34
-    body_size  = 30
-    line_h     = 42     # vertical spacing between centered body lines
-
-    parts = [
-        # Navy fill, then a red frame flush to the very edge (no navy outside it).
-        f"drawbox=x=0:y=0:w=iw:h=ih:color={navy}:t=fill",
-        f"drawbox=x=0:y=0:w=iw:h=ih:color={red}:t={border_t}",
-        # Title header at the very top, centered (white, like the rest of DASDEC).
-        f"drawtext=fontfile={font}:textfile={d}/eas_{channel_id}_dd_title.txt:reload=0"
-        f":fontsize={title_size}:fontcolor=white:x=(w-text_w)/2:y={margin + 16}",
-    ]
-
-    # Body block is centered in the region BELOW the title and ABOVE the counter.
-    title_bottom = margin + 16 + title_size + 18
-    counter_top  = f"(h-{margin + 54})"
-    page_count = max(1, len(page_line_map))
-    for pi, line_idxs in enumerate(page_line_map):
-        start = pi * page_secs
-        end = (pi + 1) * page_secs if pi < page_count - 1 else 999999
-        win = f":enable='between(t\\,{start:.2f}\\,{end})'" if page_count > 1 else ""
-        block_h = max(1, len(line_idxs)) * line_h
-        first_y = f"(({title_bottom}+{counter_top})/2 - {block_h}/2)"
-        for row, li in enumerate(line_idxs):
-            y = f"{first_y}+{row * line_h}"
-            parts.append(
-                f"drawtext=fontfile={font}:textfile={d}/eas_{channel_id}_dd_l{li}.txt:reload=0"
-                f":fontsize={body_size}:fontcolor=white:x=(w-text_w)/2:y={y}{win}"
-            )
-        if page_count > 1:
-            parts.append(
-                f"drawtext=fontfile={font}:textfile={d}/eas_{channel_id}_dd_pg{pi}.txt:reload=0"
-                f":fontsize=26:fontcolor=white:x=(w-text_w)/2:y=h-{margin+40}{win}"
-            )
-    return ",".join(parts)
-
-def _build_eas_easyplus_ticker_filter(channel_id, total_duration=60, font=None, scale=1.0):
-    """EASyPlus 'Scroll Ticker Only' -- the Trilithic EASy CGEN ticker: just the
-    crawl over the live video. A black bar in the upper-middle of the screen with
-    white monospace text scrolling slowly right-to-left; the rest of the program
-    stays visible. (No full-screen takeover.)"""
-    font = font or _font_for("easyplus")
-    if not font:
-        raise RuntimeError("No overlay font available (ship fonts/EASyText.ttf).")
-    d = RUNTIME_DIR
-    try:
-        scale = float(scale)
-    except Exception:
-        scale = 1.0
-    scale = max(0.5, min(3.0, scale))
-    txt_sz = max(10, int(round(42 * scale)))
-    band_h = int(round(txt_sz * 1.8))     # black bar height
-    band_top = "ih*0.16"                   # upper-middle, off the very top
-    # Slow, resolution-independent scroll that loops continuously for the whole
-    # alert (constant readable visual speed regardless of alert length). Lower
-    # the 0.055 factor for an even slower crawl.
-    scroll_x = f"w-mod(t*(w*0.055)\\,w+text_w+160)"
-    return (
-        f"drawbox=x=0:y={band_top}:w=iw:h={band_h}:color=black:t=fill,"
-        f"drawtext=fontfile={font}"
-        f":textfile={d}/eas_{channel_id}_ep_area.txt:reload=1"
-        f":fontsize={txt_sz}:fontcolor=white"
-        f":x={scroll_x}:y=h*0.16+({band_h}-text_h)/2"
-    )
-
-def _build_eas_dasdec_scroll_filter(channel_id, total_duration=60, font=None):
-    """DASDEC 'Scroll' banner used by Cox/Spectrum (and legacy TWC/Charter): a
-    gray two-row bar near the top over the live video. Top row is a static
-    'Emergency Alert Message' label; bottom row is the DASDEC-form alert details
-    scrolling right-to-left. The program stays visible below the bar."""
-    font = font or _font_for("dasdec")
-    if not font:
-        raise RuntimeError("No overlay font available (ship fonts/luximb.ttf).")
-    d = RUNTIME_DIR
-    row_sz = 30
-    row1_h = int(round(row_sz * 1.5))     # label row
-    row2_h = int(round(row_sz * 1.6))     # scroll row
-    band_h = row1_h + row2_h
-    gray_top = "0x1C1C1C"                  # slightly darker label strip
-    gray_bot = "0x333333"                  # scroll strip
-    total_duration = max(5.0, float(total_duration))
-    scroll_x = f"w-t*((w+text_w+80)/{total_duration:.3f})"
-    return (
-        # Two stacked gray strips near the top; live program shows below.
-        f"drawbox=x=0:y=ih*0.05:w=iw:h={row1_h}:color={gray_top}:t=fill,"
-        f"drawbox=x=0:y=ih*0.05+{row1_h}:w=iw:h={row2_h}:color={gray_bot}:t=fill,"
-        # top row: static label
-        f"drawtext=fontfile={font}"
-        f":textfile={d}/eas_{channel_id}_dd_scroll_title.txt:reload=0"
-        f":fontsize={row_sz}:fontcolor=white"
-        f":x=24:y=h*0.05+({row1_h}-text_h)/2,"
-        # bottom row: scrolling DASDEC-form details
-        f"drawtext=fontfile={font}"
-        f":textfile={d}/eas_{channel_id}_dd_scroll.txt:reload=1"
-        f":fontsize={row_sz}:fontcolor=white"
-        f":x={scroll_x}:y=h*0.05+{row1_h}+({row2_h}-text_h)/2"
-    )
-
-def _inject_drawtext(params, drawtext_filter):
-    is_audio_only = "-vn" in params or (
-        ("-c:a" in params or "-acodec" in params)
-        and "-c:v" not in params
-        and "-vcodec" not in params
-    )
-
-    if is_audio_only:
-        # Remove -vn and existing -map directives (replaced below)
-        params = re.sub(r"\s*-vn\b", "", params)
-        params = re.sub(r"\s*-map\s+\S+", "", params)
-        # Add lavfi black background as second input.
-        # If -i is present in params (self-contained profiles), insert after it.
-        # Otherwise Dispatcharr supplies input 0 externally — prepend lavfi so it
-        # becomes input 1 after Dispatcharr's stream URL.
-        lavfi = '-f lavfi -i "color=c=black:s=1280x720:r=15"'
-        new_params = re.sub(r"(-i\s+\S+)", rf"\1 {lavfi}", params, count=1)
-        if new_params == params:
-            params = f"{lavfi} {params}"
-        else:
-            params = new_params
-        _fc_graph = f'[1:v]{drawtext_filter}[vout]'
-        fc = (
-            f'-filter_complex "{_fc_graph}"'
-            f' -map "[vout]" -map 0:a:0'
-            f' -c:v libx264 -preset ultrafast -tune stillimage -crf 28'
-        )
-        if "-f mpegts" in params:
-            params = params.replace("-f mpegts", f"{fc} -f mpegts")
-        elif "pipe:1" in params:
-            params = params.replace("pipe:1", f"{fc} pipe:1")
-        else:
-            params = f"{params} {fc}"
-        return params
-
-    # Replace any stream-copy video flag — FFmpeg rejects filters with stream copy.
-    # zerolatency removes encoder lookahead/B-frames, so -c:a copy stays in sync
-    _VID_ENCODE = "-c:v libx264 -preset ultrafast -tune zerolatency -c:a copy"
-    if "-c:v copy" in params:
-        params = params.replace("-c:v copy", _VID_ENCODE)
-    elif "-vcodec copy" in params:
-        params = params.replace("-vcodec copy", _VID_ENCODE)
-    # "-c copy" copies ALL streams
-    params = re.sub(r'(?<![:\w])-c\s+copy\b', _VID_ENCODE, params)
-
-    # Deduplicate -c:a copy that arises when base profile already has it and _VID_ENCODE adds another.
-    params = re.sub(r'(\s+-c:a\s+copy){2,}', ' -c:a copy', params)
-
-    # Strip -force_key_frames. In stream-copy profiles this is ignored, but once libx264
-    # is active the expression expr:gte(t,n_forced*0) evaluates true on every single frame,
-    # forcing all-I-frame output — output bitrate explodes and the encoder can't keep up.
-    params = re.sub(r'\s*-force_key_frames\s+"[^"]*"', '', params)
-    params = re.sub(r'\s*-force_key_frames\s+\S+', '', params)
-
-    vf_clause = f'-vf "{drawtext_filter}"'
-
-    if "-vf " in params:
-        # Prepend drawtext to existing -vf, handling both quoted and unquoted forms
-        params = re.sub(r'-vf\s+"([^"]*)"', rf'-vf "{drawtext_filter},\1"', params, count=1)
-        if "-vf " in params and f'"{drawtext_filter},' not in params:
-            params = re.sub(r'-vf\s+(\S+)', rf'-vf "{drawtext_filter},\1"', params, count=1)
-    elif "-f mpegts" in params:
-        params = params.replace("-f mpegts", f"{vf_clause} -f mpegts")
-    elif "pipe:1" in params:
-        params = params.replace("pipe:1", f"{vf_clause} pipe:1")
-    else:
-        params = params + f" {vf_clause}"
-
-    # Suppress the default 1-second muxer interleave buffer. Without this, FFmpeg
-    # buffers up to 1 second of packets to interleave transcoded video against
-    # pass-through audio, producing visible startup lag on stream-copy base profiles.
-    if "-max_interleave_delta" not in params:
-        if "-f mpegts" in params:
-            params = params.replace("-f mpegts", "-max_interleave_delta 1 -f mpegts")
-        elif "pipe:1" in params:
-            params = params.replace("pipe:1", "-max_interleave_delta 1 pipe:1")
-
-    return params
-
-_DANGEROUS_FLAGS = {
-    "nobuffer":  "+nobuffer in -fflags causes audio gaps on burst-delivered streams (e.g. SiriusXM via best-streams.tv). FFmpeg passes burst gaps directly to the client with no internal buffering.",
-    "low_delay": "-flags low_delay disables decoder delay compensation, causing the same burst-gap disconnects.",
-}
-
-def _strip_dangerous_flags(channel_name, params):
-    """Strip known problematic FFmpeg flags from cloned profile parameters.
-    Logs a clear notification for every flag removed.
-    The original base profile is never modified — only the EmergencyAlertarr clone is cleaned.
-    """
-    removed = []
-
-    # Strip +nobuffer from -fflags value (e.g. -fflags +discardcorrupt+nobuffer)
-    if "nobuffer" in params:
-        def _remove_nobuffer(m):
-            value = re.sub(r'\+?nobuffer', '', m.group(2))
-            value = re.sub(r'\++', '+', value).strip('+')
-            if not value:
-                return ''
-            return m.group(1) + value
-        new_params = re.sub(r'(-fflags\s+)(\S+)', _remove_nobuffer, params)
-        if new_params != params:
-            removed.append("+nobuffer")
-            params = new_params
-
-    # Strip -flags low_delay
-    if "low_delay" in params:
-        new_params = re.sub(r'\s*-flags\s+low_delay\b', '', params)
-        if new_params != params:
-            removed.append("-flags low_delay")
-            params = new_params
-
-    for flag in removed:
-        key = flag.lstrip('+-').split()[0]
-        reason = _DANGEROUS_FLAGS.get(key, "known to cause stream issues")
-        logger.warning(
-            f"[EmergencyAlertarr] Auto-removed {flag} from cloned profile for \"{channel_name}\" "
-            f"— {reason} "
-            f"Your original base profile is unchanged."
-        )
-
-    return params, removed
-
-def _inject_eas_wav_sequence(params, mid_path=None, mid_secs=15, endec_test=False, tail_secs=7.5,
-                             wav_header=None, wav_att=None, wav_eom=None, lead_in_secs=0.0):
-    """Build a clean EAS audio sequence profile.
-
-    wav_header / wav_att / wav_eom override the default pre-recorded tone files
-    (used when tones are generated dynamically); each defaults to its constant.
-
-    Approach
-    --------
-    _inject_drawtext has already produced either:
-      (A) video stream:  params contains -vf "drawtext=..."
-      (B) audio-only:    params contains -filter_complex "..." with a lavfi black
-                         background as input [1:v] and -map 0:a:0
-
-    In both cases we need to:
-      1. Append the WAV files as additional FFmpeg inputs.
-      2. Build a filter_complex (or extend the existing one) that:
-           - keeps the video path intact                    [vout]
-           - concatenates the audio segments                [aseq]
-           - pads [aseq] with anullsrc so it never ends early (apad)
-      3. Map [vout] and [aseq] to the output.
-      4. Drop the original stream audio entirely -- EAS replaces it, not mixes.
-
-    Two audio layouts:
-      * Normal (endec_test=False):  header -> attention -> mid -> EOM
-          mid_path: optional TTS readout WAV played between attention and EOM;
-          if None, a silent gap of mid_secs is used instead.
-      * ENDEC test (endec_test=True):  header -> EOM -> tail silence
-          Mimics a real EAS ENDEC running a test: just the header tones, then
-          the end-of-message tones, then tail_secs of silence during which the
-          alert screen stays up and keeps scrolling before clearing. No
-          attention tones and no readout.
-
-    WAV inputs are appended at the END of the input list so we can calculate
-    their indices reliably regardless of what _inject_drawtext added.
-    """
+    The sequence is followed by endless silence (apad) so the audio track never
+    ends before the timed restore swaps the channel back. If the tone WAVs are
+    missing the alert still plays -- with a silent track -- rather than
+    failing to start."""
     wav_header = wav_header or _EAS_WAV_HEADER
     wav_att    = wav_att or _EAS_WAV_ATT
     wav_eom    = wav_eom or _EAS_WAV_EOM
+    fmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+    sil = "anullsrc=channel_layout=stereo:sample_rate=48000"
 
     if not _eas_wav_available(verbose=True, header=wav_header, att=wav_att, eom=wav_eom):
         logger.warning(
             "[EmergencyAlertarr] EAS: one or more tone WAVs missing/empty (see WAV lines "
             "above) -- drop valid eas_header.wav / eas_att.wav / eas_eom.wav "
-            "into the plugin dir, or enable 'Generate tones dynamically'. "
-            "Audio sequence skipped."
+            "into the plugin's wav/ folder, or enable 'Generate tones dynamically'. "
+            "Alert will play with a silent audio track."
         )
-        return params
+        return [], f"{sil},{fmt}[aseq]", "silent (tone WAVs missing)"
 
-    # ------------------------------------------------------------------ #
-    # 1. Count existing -i inputs so we know the WAV input indices        #
-    # ------------------------------------------------------------------ #
-    # Match both  -i "quoted path"  and  -i unquoted
-    existing_inputs = re.findall(r'-i\s+(?:"[^"]*"|\S+)', params)
-    n = len(existing_inputs)
-
-    # Optional lead-in: a stretch of silence prepended to the whole sequence so
-    # the tones don't begin until the video overlay has actually appeared on
-    # screen. The overlay is drawn on the live source, which can take several
-    # seconds to connect, while the tone WAVs are local and would otherwise play
-    # immediately -- leaving the header tones running over a blank picture. The
-    # lead-in absorbs that startup gap so the overlay and the header tones come
-    # up together.
-    lead_in_secs = max(0.0, float(lead_in_secs or 0))
-    if lead_in_secs > 0:
-        _lead_clause = (
-            f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={lead_in_secs},"
-            f"aformat=sample_fmts=fltp:channel_layouts=stereo[lead];"
-        )
-        _lead_lbl = "[lead]"
-        _lead_n = 1
-    else:
-        _lead_clause = ""
-        _lead_lbl = ""
-        _lead_n = 0
-
+    # The ENDEC's own output path (sample rate, filtering, compression) applied
+    # to its tones, like audio coming out of that unit. The readout keeps its
+    # own "Voice sound" setting.
+    tfmt = f"aresample=48000,{chain},{fmt}" if chain else fmt
+    n = first_idx
     if endec_test:
-        # header -> EOM -> tail silence (no attention tones, no readout)
-        wi_h = n       # eas_header.wav
-        wi_e = n + 1   # eas_eom.wav
-        wav_inputs = (
-            f' -i "{wav_header}"'
-            f' -i "{wav_eom}"'
+        inputs = [wav_header, wav_eom]
+        graph = (
+            f"[{n}:a]{tfmt}[h];"
+            f"[{n + 1}:a]{tfmt}[e];"
+            f"{sil},atrim=duration={tail_secs},{fmt}[tail];"
+            f"[h][e][tail]concat=n=3:v=0:a=1,apad[aseq]"
         )
-        # Use anullsrc (purpose-built silent source) + the SAME aformat applied
-        # to the tone segments, so all three concat inputs are byte-identical in
-        # rate/format/layout. aevalsrc here produced a layout mismatch that made
-        # concat emit silence for the whole sequence.
-        audio_graph = (
-            f"[{wi_h}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[h];"
-            f"[{wi_e}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[e];"
-            f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration=1.0,"
-            f"aformat=sample_fmts=fltp:channel_layouts=stereo[gap];"
-            f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={tail_secs},"
-            f"aformat=sample_fmts=fltp:channel_layouts=stereo[tail];"
-            f"{_lead_clause}"
-            f"{_lead_lbl}[h][gap][e][tail]concat=n={4 + _lead_n}:v=0:a=1,apad[aseq]"
-        )
-        wi_log = f"{wi_h},{wi_e}"
-        mid_desc = f"ENDEC test (header+EOM+{tail_secs}s tail)"
+        return inputs, graph, f"ENDEC test (header+EOM+{tail_secs}s tail)"
+
+    if mid_path:
+        inputs = [wav_header, wav_att, mid_path, wav_eom]
+        mid = f"[{n + 2}:a]{fmt}[mid];"
+        e_idx = n + 3
+        desc = "TTS readout"
     else:
-        wi_h = n       # eas_header.wav  (input n)
-        wi_a = n + 1   # eas_att.wav     (input n+1)
-        if mid_path:
-            wi_m = n + 2   # TTS readout wav (input n+2)
-            wi_e = n + 3   # eas_eom.wav     (input n+3)
-            wav_inputs = (
-                f' -i "{wav_header}"'
-                f' -i "{wav_att}"'
-                f' -i "{mid_path}"'
-                f' -i "{wav_eom}"'
-            )
-            mid_clause = f"[{wi_m}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[mid];"
-        else:
-            wi_e = n + 2   # eas_eom.wav     (input n+2)
-            wav_inputs = (
-                f' -i "{wav_header}"'
-                f' -i "{wav_att}"'
-                f' -i "{wav_eom}"'
-            )
-            mid_clause = (
-                f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=duration={mid_secs},"
-                f"aformat=sample_fmts=fltp:channel_layouts=stereo[mid];"
-            )
-        audio_graph = (
-            f"[{wi_h}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[h];"
-            f"[{wi_a}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a];"
-            f"{mid_clause}"
-            f"[{wi_e}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[e];"
-            f"{_lead_clause}"
-            f"{_lead_lbl}[h][a][mid][e]concat=n={4 + _lead_n}:v=0:a=1,apad[aseq]"
-        )
-        wi_log = f"{wi_h},{wi_a},{wi_e}"
-        mid_desc = "TTS readout" if mid_path else f"{mid_secs}s silence"
-
-    # ------------------------------------------------------------------ #
-    # 3. Wire into the existing filter graph                               #
-    # ------------------------------------------------------------------ #
-    fc_match = re.search(r'-filter_complex\s+"((?:[^"\\]|\\.)*)"', params)
-    vf_match  = re.search(r'-vf\s+"([^"]+)"', params)
-
-    if fc_match:
-        # Case B: audio-only -- already has filter_complex with [vout]
-        # Extend it: append audio_graph, update maps
-        existing_fc = fc_match.group(1)
-        new_fc = existing_fc + ";" + audio_graph
-        params = (
-            params[:fc_match.start()]
-            + f'-filter_complex "{new_fc}"'
-            + params[fc_match.end():]
-        )
-        # Replace -map 0:a:0 (original stream audio) with [aseq]
-        params = re.sub(r'\s*-map\s+0:a:0\b', ' -map "[aseq]"', params)
-        # Remove any other bare -map 0 that would pull in original audio
-        params = re.sub(r'\s*-map\s+0(?!:)', '', params)
-
-    elif vf_match:
-        # Case A: video stream -- has -vf, no filter_complex yet
-        vf_filter = vf_match.group(1)
-        video_graph = f"[0:v]{vf_filter}[vout]"
-        full_fc = video_graph + ";" + audio_graph
-        fc_clause = f'-filter_complex "{full_fc}" -map "[vout]" -map "[aseq]"'
-        params = params[:vf_match.start()] + fc_clause + params[vf_match.end():]
-        # Remove bare -map 0 (filter_complex maps replace it)
-        params = re.sub(r'\s*-map\s+0(?!:)', '', params)
-
-    else:
-        logger.warning("[EmergencyAlertarr] EAS: no -vf or -filter_complex found -- audio skipped")
-        return params
-
-    # ------------------------------------------------------------------ #
-    # 4. Insert WAV inputs right after the last existing -i clause        #
-    # ------------------------------------------------------------------ #
-    # FFmpeg treats any option placed before an -i as belonging to that
-    # input, not as a global/output flag. Inserting the WAV inputs near the
-    # output marker (the old approach) left output flags like "-c:a aac
-    # -b:a 192k" sitting *before* these new inputs in the command line,
-    # which FFmpeg then tried to apply to eas_header.wav as an input option
-    # -- producing "Error opening input files: Invalid argument" and a dead
-    # stream. Inserting right after the last existing input keeps all -i
-    # clauses grouped together, ahead of every output flag, as FFmpeg requires.
-    input_matches = list(re.finditer(r'-i\s+(?:"[^"]*"|\S+)', params))
-    if input_matches:
-        insert_at = input_matches[-1].end()
-        params = params[:insert_at] + wav_inputs + params[insert_at:]
-    else:
-        params = wav_inputs + " " + params
-
-    # ------------------------------------------------------------------ #
-    # 5. Force audio re-encode (can't stream-copy when building concat)   #
-    # ------------------------------------------------------------------ #
-    params = re.sub(r'\s*-c:a\s+copy\b', ' -c:a aac -b:a 192k', params)
-    params = re.sub(r'\s*-acodec\s+copy\b', ' -c:a aac -b:a 192k', params)
-    params = re.sub(r'(\s+-c:a\s+aac\s+-b:a\s+192k){2,}', ' -c:a aac -b:a 192k', params)
-
-    # ------------------------------------------------------------------ #
-    # 6. Drop subtitle & data streams for the duration of the alert       #
-    # ------------------------------------------------------------------ #
-    # The overlay is a full-screen takeover, so the underlying program's
-    # subtitle/teletext/data streams must not pass through -- otherwise a
-    # client can render the original show's captions on top of the black
-    # EAS screen, and stray data streams can upset the mpegts muxer. We only
-    # -map [vout] and [aseq], so nothing else is mapped, but -sn -dn makes the
-    # intent explicit and covers any base profile that sneaks a stream in.
-    if "-sn" not in params:
-        if "-f mpegts" in params:
-            params = params.replace("-f mpegts", "-sn -dn -f mpegts", 1)
-        elif "pipe:1" in params:
-            params = params.replace("pipe:1", "-sn -dn pipe:1", 1)
-        else:
-            params = params + " -sn -dn"
-
-    logger.info(
-        f"[EmergencyAlertarr] EAS: WAV sequence injected "
-        f"(inputs {wi_log} / mid={mid_desc})"
+        inputs = [wav_header, wav_att, wav_eom]
+        mid = f"{sil},atrim=duration={mid_secs},{fmt}[mid];"
+        e_idx = n + 2
+        desc = f"{mid_secs}s silence"
+    graph = (
+        f"[{n}:a]{tfmt}[h];"
+        f"[{n + 1}:a]{tfmt}[a];"
+        f"{mid}"
+        f"[{e_idx}:a]{tfmt}[e];"
+        f"[h][a][mid][e]concat=n=4:v=0:a=1,apad[aseq]"
     )
-    return params
+    return inputs, graph, desc
 
-_EAS_TRANSCODE_PREFIXES = {
-    # Filter prefix prepended to the EAS overlay filter chain.
-    # Applied at clone time; removed automatically when the alert clears and the
-    # original profile is restored.  "full" = no prefix (transcode at source quality).
-    "full":    "",
-    "1080p30": "fps=fps=30,",
-    "720p":    "scale=1280:720:flags=fast_bilinear,",
-    "720p30":  "scale=1280:720:flags=fast_bilinear,fps=fps=30,",
+# Alert canvas per "Transcode Quality" setting: (width, height). The overlay is
+# a full takeover, so the alert is rendered on an FFmpeg-generated canvas
+# instead of decoding the live channel underneath it.
+_EAS_CANVAS = {
+    "full":    (1920, 1080),
+    "1080p30": (1920, 1080),
+    "720p":    (1280, 720),
+    "720p30":  (1280, 720),
 }
+
+_EAS_FPS = 30
+
+# Seconds of alert the encoder may burst out immediately on start. Dispatcharr
+# holds a (re)connecting viewer until ~1 MB is buffered and treats an FFmpeg
+# speed below 1.0x as "buffering" (and fails over after 15 s); a short burst
+# satisfies both at once, so the alert screen appears almost immediately.
+_EAS_BURST_SECS = 4
+
+_ffmpeg_opts_cache = {}
+
+def _ffmpeg_has_option(name, binary="ffmpeg"):
+    """True if the installed FFmpeg knows `-name` (checked once, cached)."""
+    key = (binary, name)
+    if key not in _ffmpeg_opts_cache:
+        ok = True   # assume modern FFmpeg (Dispatcharr ships 8.x) if the probe fails
+        try:
+            exe = shutil.which(binary) or binary
+            out = subprocess.run([exe, "-hide_banner", "-h", "full"],
+                                 capture_output=True, text=True, timeout=10).stdout
+            if out:
+                ok = f"-{name} " in out
+        except Exception:
+            pass
+        _ffmpeg_opts_cache[key] = ok
+    return _ffmpeg_opts_cache[key]
+
+def _eas_video_kbps(height):
+    """Constant video bitrate for the alert screen. Static text compresses to
+    almost nothing (tens of kbps), which left Dispatcharr waiting 30-60 s to
+    fill its ~1 MB start buffer before the viewer saw anything -- the long
+    DASDEC switch-over. Padding to a fixed CBR fills it in well under a second."""
+    return 4000 if height >= 1080 else 2500
+
+def _build_eas_ffmpeg_params(overlay, out_w, out_h, audio_inputs, audio_graph_fn, max_secs=None,
+                             sd_look=False, preroll=None, end_glitch=None, end_style="clean",
+                             end_freeze=1.0, tag=None):
+    """Complete, self-contained FFmpeg parameter string for an alert profile.
+
+    Full-screen styles are drawn on a generated canvas (lavfi colour source):
+    FFmpeg never has to connect to the provider, probe, wait for a keyframe or
+    decode the channel before the first alert frame. Ticker styles that run
+    over the program open the live stream instead ({streamUrl}/{userAgent}
+    are filled in by Dispatcharr), so they start a little slower.
+
+    sd_look:    render the page through a 480-line, chroma-smeared SD path
+                (older DASDEC / EASyPLUS / Gorman-Redlich units were SD boxes)
+    preroll:    {"path", "secs"} -- a pre-rendered clip played first (force-
+                tune mode: the details channel, then the blocky retune)
+    end_glitch: seconds into the output at which the picture breaks up as the
+                set-top retunes back (force-tune mode)
+
+    audio_graph_fn(first_input_index) -> filter graph producing [aseq]."""
+    fps = _EAS_FPS
+    kbps = _eas_video_kbps(out_h)
+    if _ffmpeg_has_option("readrate_initial_burst"):
+        pace = f"-re -readrate_initial_burst {_EAS_BURST_SECS}"
+    else:
+        pace = "-readrate 1.1"
+    if overlay.get("live"):
+        inputs = ["-user_agent {userAgent} -i {streamUrl}"]
+        video = (f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+                 f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps={fps},"
+                 f"format=yuv420p,{overlay['filter']},{overlay['finish']}")
+    else:
+        cw, ch, bg = overlay["canvas"]
+        inputs = [f'{pace} -f lavfi -i "color=c={bg}:s={cw}x{ch}:r={fps}"']
+        sd = ("," + _eas_sd_chain(cw, ch)) if sd_look else ""
+        video = f"[0:v]format=yuv420p,{overlay['filter']}{sd},{overlay['finish']},format=yuv420p"
+    pre_secs = float((preroll or {}).get("secs") or 0.0)
+    if end_glitch and end_style == "blocky":
+        t0 = max(1.0, float(end_glitch) - pre_secs)
+        video += (f"[vm];[vm]split=2[vk][vg];"
+                  f"[vg]scale=iw/24:ih/24:flags=area,scale={out_w}:{out_h}:flags=neighbor,"
+                  f"eq=brightness=-0.08:saturation=0.7[vb];"
+                  f"[vk][vb]overlay=enable='gte(t,{t0:.2f})'")
+    elif end_glitch:
+        # Retune back to the channel: the alert picture freezes, then black
+        # until the stream switches back.
+        t0 = max(1.0, float(end_glitch) - pre_secs)
+        f0 = int(round(t0 * fps))
+        f1 = int(round((t0 + max(0.0, float(end_freeze))) * fps))
+        frz = (f"[vm];[vm]split=2[va][vr];[va][vr]freezeframes=first={f0}:last={f1}:replace={f0}"
+               if f1 > f0 else "")
+        video += (f"{frz},drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:"
+                  f"enable='gte(t,{(t0 + max(0.0, float(end_freeze))):.2f})'")
+    for p in audio_inputs:
+        inputs.append(f'-i "{p}"')
+    agraph = audio_graph_fn(1)
+    post = overlay.get("post")
+    if preroll:
+        pidx = 1 + len(audio_inputs)
+        inputs.append(f'-i "{preroll["path"]}"')
+        agraph = agraph[::-1].replace("]qesa[", "]0qesa[", 1)[::-1]    # last [aseq] -> [aseq0]
+        tail = (f"[vc];[vc]{post},format=yuv420p[vout]" if post else "[vout]")
+        fc = (f"{video}[v1];"
+              f"[{pidx}:v]fps={fps},scale={out_w}:{out_h},format=yuv420p,setsar=1[pv];"
+              f"[pv][v1]concat=n=2:v=1:a=0{tail};"
+              f"{agraph};"
+              f"[{pidx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[pa];"
+              f"[pa][aseq0]concat=n=2:v=0:a=1[aseq]")
+    else:
+        fc = (f"{video},{post},format=yuv420p[vout];{agraph}" if post else f"{video}[vout];{agraph}")
+    return (
+        "-hide_banner -nostdin "
+        + " ".join(inputs)
+        + f' -filter_complex "{fc}"'
+        + ' -map "[vout]" -map "[aseq]"'
+        + " -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p"
+        + f" -g {fps} -keyint_min {fps} -sc_threshold 0"
+        + f" -b:v {kbps}k -minrate {kbps}k -maxrate {kbps}k -bufsize {kbps // 2}k"
+        + " -x264-params nal-hrd=cbr"
+        + " -c:a aac -b:a 192k -ar 48000 -ac 2"
+        # Last-resort cap: an alert process can never outlive its sequence by
+        # more than a few minutes, even if the restore's stream restart failed.
+        + (f" -t {float(max_secs):.2f}" if max_secs else "")
+        + (f" -metadata service_name=EAA-{tag}" if tag else "")
+        + " -sn -dn -flush_packets 1 -f mpegts pipe:1"
+    )
+
+def _eas_sd_chain(cw, ch):
+    """480-line SD path: area downscale, NTSC-ish chroma smear and delay, a
+    touch of noise, then back up to the canvas size (soft, like a set-top
+    upscaling a 480i channel)."""
+    return ("scale=-2:480:flags=area,format=yuv420p,"
+            "boxblur=luma_radius=0:luma_power=0:chroma_radius=3:chroma_power=1,"
+            "chromashift=cbh=2:crh=1,noise=c0s=3:c0f=t,"
+            f"scale={cw}:{ch}:flags=bicubic")
+
+# Styles drawn over the live program (no retune lead-in for those).
+_EAS_LIVE_STYLE_KEYS = {"easyplus_ticker", "crawl_overlay", "gorman_redlich_overlay", "sara", "sara_classic"}
+
+# Older, SD-era screen styles that get the 480-line look when it's on.
+_EAS_LEGACY_STYLES = {
+    "dasdec_legacy", "easyplus", "easyplus_middle", "easyplus_bottom", "easyplus_gray",
+    "easyplus_grayblack", "gorman_redlich", "vds_subalert", "easycap",
+}
+
+# Which ENDEC's sound goes with each screen style ("auto").
+_STYLE_ENDEC = {
+    "easyplus": "trilithic", "easycap": "easycap", "gorman": "gorman",
+    "vds": "sage_1822",
+}
+
+def _eas_endec_for_style(style):
+    st = (style or "").lower()
+    for prefix, endec in _STYLE_ENDEC.items():
+        if st.startswith(prefix):
+            return endec
+    return "dasdec"           # DASDEC, SARA/DASDEC headends, set-top and ticker styles
 
 def _eas_seq_fixed_overhead(header=None, att=None, eom=None):
     """Combined duration of the header tone + attention tone + EOM tone WAVs,
@@ -863,78 +482,105 @@ def _eas_seq_fixed_overhead(header=None, att=None, eom=None):
         + _wav_duration_secs(eom)
     )
 
-def _clone_and_inject_eas(channel_id, original_profile, channel_name="", silence_secs=15,
+def _eas_tts_cached(spoken, tts_opts=None):
+    """Synthesize (or reuse) the readout WAV for this exact text + voice. When
+    one alert fires on several channels at once the readout is generated once
+    instead of once per channel."""
+    import hashlib
+    key = hashlib.md5((tts_cache_key(tts_opts) + "\n" + spoken).encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(RUNTIME_DIR, f"eas_tts_{key}.wav")
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > 200:
+            os.utime(path, None)
+            return path
+    except Exception:
+        pass
+    tmp = path + f".tmp{os.getpid()}.wav"
+    if _eas_tts_synthesize(spoken, tmp, tts_opts):
+        try:
+            os.replace(tmp, path)
+            # Keep the runtime dir tidy: drop readouts not used for a day.
+            cutoff = time.time() - 86400
+            for fn in os.listdir(RUNTIME_DIR):
+                if fn.startswith("eas_tts_") and fn.endswith(".wav"):
+                    fp = os.path.join(RUNTIME_DIR, fn)
+                    try:
+                        if os.path.getmtime(fp) < cutoff:
+                            os.remove(fp)
+                    except Exception:
+                        pass
+            return path
+        except Exception:
+            return tmp
+    return None
+
+def _clone_and_inject_eas(channel_id, original_profile=None, channel_name="", silence_secs=15,
                           transcode_mode="full", style="easyplus", unique_alerts=None,
                           use_tts=True, endec_test=False, tail_secs=7.5,
                           generate_tones=False, att_secs=8.0,
-                          easyplus_font=None, easyplus_scale=1.0, lead_in_secs=0.0,
-                          relay_message_wav=None, relay_message_secs=0.0):
-    """Clone the channel's profile into an EAS-overlay profile.
+                          easyplus_font=None, easyplus_scale=1.0, style_opts=None,
+                          tts_opts=None, endec=None, audio_opts=None, video_opts=None,
+                          preroll=None, eom_only=False, national_hold=False):
+    """Create the EAS-overlay stream profile for one channel.
 
     Returns (profile, removed_flags, total_duration). total_duration is the
     authoritative length of the whole alert sequence -- the audio concat, the
     EASyPlus scroll, and the DASDEC pagination are all timed to it so they all
-    finish together (the scroll no longer gets cut off halfway, and the screen
-    stays up exactly until the audio ends). Callers use the returned value to
-    schedule the timed restore.
+    finish together. Callers use it to schedule the timed restore.
 
-    endec_test: if True, build the real-ENDEC-style test sequence instead of
-    the normal one: header tones -> EOM tones -> tail_secs of silence with the
-    alert screen still up and scrolling, then clear. No attention tones, no TTS.
+    original_profile is only used for naming (it may be None for channels that
+    use the system default profile): the alert profile is a self-contained
+    FFmpeg command, independent of the channel's normal profile, so odd base
+    profiles (streamlink/VLC, hwaccel flags, existing -vf chains) can no longer
+    break the alert.
+
+    endec_test: header tones -> EOM tones -> tail_secs of silence with the
+    alert screen still up, then clear. No attention tones, no TTS.
     """
     from core.models import StreamProfile
-    raw_params = original_profile.parameters or ""
-    cleaned_params, removed_flags = _strip_dangerous_flags(
-        channel_name or f"channel {channel_id}", raw_params
-    )
+    _ensure_dirs()
 
     # Hard guarantee: never render more than one alert on screen or in the
-    # readout. Callers already pass a single record, but this makes the
-    # "one alert at a time" rule impossible to violate (no ALERT/ALERT/ALERT,
-    # no every-county pile-up) even if something upstream regresses.
+    # readout, even if something upstream regresses.
     unique_alerts = list(unique_alerts or [])[:1]
 
-    # --- Decide the middle audio segment (relay message vs TTS readout vs silence)
+    # --- Middle audio segment (TTS readout vs plain silence) -----------------
     mid_path = None
     mid_secs = silence_secs
-    if relay_message_wav and os.path.exists(relay_message_wav) and not endec_test:
-        # ENDEC relay mode: air the REAL captured message audio between the
-        # (regenerated) attention tone and EOM, exactly like a real ENDEC
-        # forwarding the received message. No TTS.
-        mid_path = relay_message_wav
-        try:
-            mid_secs = (float(relay_message_secs) or _wav_duration_secs(relay_message_wav)) + 1.0
-        except Exception:
-            mid_secs = _wav_duration_secs(relay_message_wav) + 1.0
-    elif not endec_test and use_tts and _TTS_BIN and unique_alerts:
-        texts = _eas_alert_texts(unique_alerts)
-        spoken = texts.get("spoken", "") or ""
+    aopts = dict(audio_opts or {})
+    vopts = dict(video_opts or {})
+    cap_audio = None
+    if eom_only:
+        endec_test = True
+    if not endec_test and unique_alerts and aopts.get("cap_audio", True):
+        cap_audio = _eas_cap_audio_file(unique_alerts[0])
+    if cap_audio:
+        # The alert carries its own recorded message (IPAWS "EAS Broadcast
+        # Content"): a DASDEC plays that instead of synthesizing speech.
+        mid_path = cap_audio
+        mid_secs = min(_wav_duration_secs(cap_audio) or _eas_media_secs(cap_audio), 120.0) + 2.0
+        logger.info(f"[EmergencyAlertarr] EAS: using the alert's own audio message for ch {channel_id}")
+    elif not endec_test and use_tts and tts_available(tts_opts) and unique_alerts:
+        spoken = eas_spoken_text(unique_alerts[0], style_opts or {})
         if len(spoken) > _EAS_MAX_SPOKEN_CHARS:
-            # Trim to the last sentence break within the limit so a very long
-            # alert can't produce a runaway readout (and a runaway duration).
             cut = spoken[:_EAS_MAX_SPOKEN_CHARS]
             dot = cut.rfind(". ")
             spoken = (cut[:dot + 1] if dot > 200 else cut).strip()
-        tts_path = os.path.join(RUNTIME_DIR, f"eas_{channel_id}_tts.wav")
-        if _eas_tts_synthesize(spoken, tts_path):
+        tts_path = _eas_tts_cached(spoken, tts_opts) if spoken else None
+        if tts_path:
             mid_path = tts_path
-            # Pad the spoken segment with a little breathing room before EOM.
             mid_secs = _wav_duration_secs(tts_path) + 2.0
         else:
             logger.info(f"[EmergencyAlertarr] EAS: TTS unavailable for ch {channel_id}, using silence")
 
     # --- Optional: synthesize the tone WAVs dynamically ----------------------
-    # When enabled, the header tones encode the real SAME data for this alert
-    # (so more counties => a longer header burst) and the attention tone honors
-    # the configured length. Falls back to the pre-recorded WAVs if generation
-    # fails. gen_h/gen_a/gen_e stay None when disabled, so every downstream call
-    # transparently uses the default eas_*.wav files.
     gen_h = gen_a = gen_e = None
     if generate_tones:
-        src_alert = (unique_alerts or [{}])[0] if unique_alerts else {}
+        src_alert = unique_alerts[0] if unique_alerts else {}
         header_str = _eas_same_header_string(src_alert)
         gen = _eas_generate_tone_wavs(
-            channel_id, header_str, att_secs, want_attn=not endec_test
+            channel_id, header_str, att_secs, want_attn=not endec_test,
+            endec=endec or _eas_endec_for_style(style),
         )
         if gen:
             gen_h, gen_a, gen_e = gen
@@ -944,111 +590,225 @@ def _clone_and_inject_eas(channel_id, original_profile, channel_name="", silence
                 "-- falling back to pre-recorded WAVs."
             )
 
+    # --- Render the whole audio track offline (loudness, encoder quirks) -----
+    endec_name = endec or _eas_endec_for_style(style)
+    seq = None
+    if aopts.get("render", True):
+        h = gen_h or _EAS_WAV_HEADER
+        a = gen_a or _EAS_WAV_ATT
+        e = gen_e or _EAS_WAV_EOM
+        if _eas_wav_available(header=h, att=a, eom=e):
+            if eom_only:
+                parts = [{"kind": "silence", "secs": 0.5}, {"kind": "tone", "path": e},
+                         {"kind": "silence", "secs": 2.0}]
+            elif endec_test:
+                parts = [{"kind": "tone", "path": h}, {"kind": "tone", "path": e},
+                         {"kind": "silence", "secs": tail_secs}]
+            elif national_hold:
+                # EAN: header, attention signal, message -- the EOM is sent
+                # only when the national alert is over.
+                mid = ({"kind": "voice", "path": mid_path} if mid_path
+                       else {"kind": "silence", "secs": mid_secs})
+                parts = [{"kind": "tone", "path": h}, {"kind": "tone", "path": a}, mid]
+            else:
+                mid = ({"kind": "voice", "path": mid_path} if mid_path
+                       else {"kind": "silence", "secs": mid_secs})
+                parts = [{"kind": "tone", "path": h}, {"kind": "tone", "path": a}, mid,
+                         {"kind": "tone", "path": e}]
+            _ensure_dirs()
+            import hashlib
+            sig = json.dumps([[p.get("kind"), p.get("secs"),
+                               (os.path.basename(p["path"]), os.path.getsize(p["path"]),
+                                int(os.path.getmtime(p["path"]) // 60)) if p.get("path") else None]
+                              for p in parts] + [_eas_same_header_string(unique_alerts[0] if unique_alerts else {}),
+                                                 endec_name, sorted((k, str(v)) for k, v in aopts.items())])
+            skey = hashlib.md5(sig.encode("utf-8")).hexdigest()[:16]
+            spath = os.path.join(RUNTIME_DIR, f"seq_{skey}.wav")
+            hit = _eas_seq_cache.get(skey)
+            if hit and os.path.isfile(spath):
+                seq = hit
+            else:
+                _eas_mutex_touch()
+                seq = render_alert_audio(
+                    spath, parts,
+                    chain=endec_audio_chain(endec_name),
+                    loudness=aopts.get("loudness", "-24"),
+                    tone_offset_lu=aopts.get("tone_offset", 8.0),
+                    channels=aopts.get("channels", "both"),
+                    hum=aopts.get("hum"), switch_click=aopts.get("click", False),
+                    boost_db=aopts.get("boost_db", 0.0),
+                )
+                if seq:
+                    if len(_eas_seq_cache) > 20:
+                        _eas_seq_cache.clear()
+                    _eas_seq_cache[skey] = seq
+                    _eas_cleanup_seq_files()
+
     # --- Authoritative total sequence duration -------------------------------
-    if endec_test:
-        # ENDEC test layout: header + EOM (no attention tone) + tail silence.
+    if seq:
+        total_duration = seq["duration"] + 1.0
+    elif endec_test:
         _hdr = gen_h or _EAS_WAV_HEADER
         _eom = gen_e or _EAS_WAV_EOM
         header_eom = (
             (_wav_duration_secs(_hdr) + _wav_duration_secs(_eom))
             if _eas_wav_available(header=gen_h, att=gen_a, eom=gen_e) else 6.0
         )
-        # header + 1s gap + EOM + tail silence (+1s buffer so the screen doesn't
-        # vanish on the last sample). The 1s gap separates the header from the EOM
-        # so they don't run together and sound like one blurred burst.
-        total_duration = header_eom + 1.0 + tail_secs + 1.0
+        total_duration = header_eom + tail_secs + 1.0
     else:
-        # header + attention + (TTS or silence) + EOM, with a small tail so the
-        # screen doesn't vanish the instant the last tone sample plays.
         total_duration = _eas_seq_fixed_overhead(gen_h, gen_a, gen_e) + mid_secs + 2.0
 
-    # Absolute ceiling: a single alert takeover can never exceed this, so a
-    # pathological alert (or any future regression) can't strand a channel for
-    # the better part of an hour.
     if total_duration > _EAS_MAX_ALERT_SECS:
         logger.warning(
             f"[EmergencyAlertarr] EAS: computed duration {total_duration:.0f}s exceeds cap "
             f"-- clamping to {_EAS_MAX_ALERT_SECS}s (ch {channel_id})"
         )
         total_duration = float(_EAS_MAX_ALERT_SECS)
-    # --- Build the video overlay filter for the chosen style -----------------
-    # Full-takeover styles (easyplus / dasdec) cover the whole screen; crawl
-    # styles (easyplus_ticker / dasdec_scroll) draw only a band and leave the
-    # live program visible. All render as a plain -vf drawtext chain.
-    transcode_prefix = _EAS_TRANSCODE_PREFIXES.get(transcode_mode, "")
-    _font_ep = _resolve_font(easyplus_font, "easyplus")
-    _font_dd = _resolve_font(easyplus_font, "dasdec")
-    if style == "dasdec":
-        # Full DASDEC takeover: no source shows through and it's drawtext-heavy,
-        # so default it to a light 720p/15fps encode when the user hasn't chosen
-        # a transcode quality. (Crawl styles skip this -- the program is visible.)
-        if transcode_mode == "full":
-            transcode_prefix = "scale=1280:720:flags=fast_bilinear,fps=fps=15,"
-        dd_texts = _eas_alert_texts(unique_alerts or [])
-        block_lines = _eas_dasdec_block_lines(unique_alerts or [], dd_texts)
-        _atomic_write(f"eas_{channel_id}_dd_title.txt", "Emergency Alert Details")
-        page_line_map, page_secs = _eas_dasdec_pages(channel_id, block_lines, total_duration)
-        eas_filter = transcode_prefix + _build_eas_dasdec_filter(
-            channel_id, page_line_map, page_secs, font=_font_dd)
-    elif style == "easyplus_ticker":
-        eas_filter = transcode_prefix + _build_eas_easyplus_ticker_filter(
-            channel_id, total_duration=total_duration, font=_font_ep, scale=easyplus_scale)
-    elif style == "dasdec_scroll":
-        eas_filter = transcode_prefix + _build_eas_dasdec_scroll_filter(
-            channel_id, total_duration=total_duration, font=_font_dd)
-    else:
-        eas_filter = transcode_prefix + _build_eas_easyplus_filter(
-            channel_id, total_duration=total_duration, font=_font_ep, scale=easyplus_scale)
 
-    params = _inject_drawtext(cleaned_params, eas_filter)
-    params = _inject_eas_wav_sequence(
-        params, mid_path=mid_path, mid_secs=mid_secs,
-        endec_test=endec_test, tail_secs=tail_secs,
-        wav_header=gen_h, wav_att=gen_a, wav_eom=gen_e,
-        lead_in_secs=lead_in_secs,
-    )
+    # --- Video: the selected EAS screen style --------------------------------
+    out_w, out_h = _EAS_CANVAS.get(transcode_mode, (1920, 1080))
+    _eas_clear(channel_id)
+    sopts = dict(style_opts or {})
+    sopts.setdefault("scale", easyplus_scale)
+    if easyplus_font:
+        sopts.setdefault("font_override", easyplus_font)
+    overlay = build_style_overlay(channel_id, unique_alerts[0] if unique_alerts else {},
+                                  style, out_w, out_h, sopts)
+
+    holder = {}
+    live_prog = (overlay.get("live") and (aopts.get("program") or "switch") in ("switch", "duck")
+                 and aopts.get("has_audio", True) is not False)
+    audio_end = (seq or {}).get("audio_end") or total_duration
+
+    def _agraph(first):
+        if seq:
+            ins = [seq["path"]]
+            desc = "rendered sequence" + (f", program {aopts.get('program')}" if live_prog else "")
+            fmt = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+            if live_prog:
+                # Program audio under/around the alert: "switch" = the ENDEC's
+                # audio switch (program off while EAS audio plays, back after
+                # the EOM); "duck" = program kept low underneath.
+                g = 0.0 if aopts.get("program") == "switch" else 10 ** (-abs(float(aopts.get("duck_db", 18))) / 20)
+                back = audio_end + 0.3
+                graph = (f"[0:a]asetpts=PTS-STARTPTS,{fmt},"
+                         f"volume='if(lt(t,{back:.2f}),{g:.4f},1)':eval=frame[prog];"
+                         f"[{first}:a]{fmt},apad[eas];"
+                         f"[prog][eas]amix=inputs=2:duration=first:normalize=0[aseq]")
+            else:
+                graph = f"[{first}:a]{fmt},apad[aseq]"
+        elif eom_only:
+            e_wav = gen_e or _EAS_WAV_EOM
+            ins = [e_wav]
+            desc = "EOM only"
+            graph = (f"[{first}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                     f"apad[aseq]")
+        else:
+            ins, graph, desc = _eas_audio_graph(
+                first, mid_path=mid_path, mid_secs=mid_secs,
+                endec_test=endec_test, tail_secs=tail_secs,
+                wav_header=gen_h, wav_att=gen_a, wav_eom=gen_e,
+                chain=endec_audio_chain(endec_name),
+            )
+        holder["inputs"], holder["desc"] = ins, desc
+        return graph
+
+    _agraph(1)   # resolve the audio inputs first (input 0 is always the video source)
+    sd = vopts.get("sd_look") and not overlay.get("live") and (
+        vopts.get("sd_look") == "all" or style in _EAS_LEGACY_STYLES)
+    pre = preroll if (preroll and preroll.get("path") and os.path.isfile(preroll["path"])) else None
+    if pre:
+        total_duration += float(pre.get("secs") or 0.0)
+    # The alert stream ENDS by itself once the sequence (and the freeze/black
+    # on the way out) is over: Dispatcharr then reconnects the session to the
+    # channel's normal profile without dropping any player (see
+    # _eas_seamless_arm). Players never have to reconnect after an alert --
+    # some (TiviMate) don't always come back from a server-side disconnect.
+    out_tail = (float((audio_opts or {}).get("retune_freeze", 1.0)) + _EAS_RETUNE_BLACK) if pre else 0.4
+    stream_end = total_duration + out_tail
+    tag = f"ch{channel_id}-{int(time.time() * 1000)}"
+    _eas_clone_info[str(channel_id)] = {"tag": tag, "end": stream_end}
+    params = _build_eas_ffmpeg_params(overlay, out_w, out_h, holder["inputs"], _agraph,
+                                      max_secs=(4 * 3600 if national_hold else stream_end),
+                                      sd_look=bool(sd), preroll=pre,
+                                      end_glitch=(total_duration if (pre and not national_hold) else None),
+                                      end_style=(pre or {}).get("end", "clean"),
+                                      end_freeze=(audio_opts or {}).get("retune_freeze", 1.0),
+                                      tag=tag)
+    audio_desc = holder["desc"]
+    width, height = out_w, out_h
+
+    base_cmd = (getattr(original_profile, "command", "") or "").strip()
+    command = base_cmd if os.path.basename(base_cmd).lower().startswith("ffmpeg") else "ffmpeg"
+    base_name = getattr(original_profile, "name", None) or "default"
 
     profile = StreamProfile(
-        name=f"{PROFILE_PREFIX}EAS [{original_profile.name}] [ch{channel_id}]",
-        command=original_profile.command,
+        name=f"{PROFILE_PREFIX}EAS [{base_name}] [ch{channel_id}]",
+        command=command,
         parameters=params,
         locked=False,
         is_active=True,
     )
     profile.save()
     logger.info(
-        f"emergencyalertarr: EAS profile cloned {original_profile.id} → {profile.id} "
-        f"for channel {channel_id} (style={style}, dur={total_duration:.1f}s, "
-        f"tts={'yes' if mid_path else 'no'})"
-        + (f" (removed: {', '.join(removed_flags)})" if removed_flags else "")
+        f"emergencyalertarr: EAS profile {profile.id} created for channel {channel_id} "
+        f"(style={style}, {width}x{height}, pages={overlay.get('pages', 1)}, "
+        f"dur={total_duration:.1f}s, audio={audio_desc})"
     )
-    # The restore countdown must cover the lead-in silence too (the overlay is
-    # on screen during it), so report the full wall-clock length. The visible
-    # tone/scroll/page timing above deliberately excludes the lead-in.
-    return profile, removed_flags, total_duration + max(0.0, float(lead_in_secs or 0))
+    return profile, [], total_duration
 
-def _assign_profile(channel, profile):
-    channel.stream_profile = profile
-    channel.save(update_fields=["stream_profile"])
+def _eas_profile_slot(channel):
+    """Where this channel's effective stream profile lives. Auto-synced
+    channels can carry a ChannelOverride whose stream_profile wins over the
+    channel's own field -- writing the alert profile to the channel field there
+    did nothing, so the alert silently never appeared."""
     try:
-        channel.update_stream_profile(profile.id)
+        ov = channel.override
     except Exception:
-        pass
+        ov = None
+    if ov is not None and getattr(ov, "stream_profile_id", None):
+        return "override", ov
+    return "channel", channel
 
-def _restore_profile(channel, original_profile_id):
-    from core.models import StreamProfile
-    if not original_profile_id:
-        # No known original profile (e.g. legacy/incomplete mapping data) --
-        # nothing safe to restore to, so just clear the profile rather than crash.
-        channel.stream_profile = None
-        channel.save(update_fields=["stream_profile"])
-        return
+def _eas_effective_profile(channel):
+    """The StreamProfile the channel actually plays with (override first), or
+    None when it falls back to the system default profile."""
+    _slot, obj = _eas_profile_slot(channel)
     try:
-        original = StreamProfile.objects.get(id=original_profile_id)
-        _assign_profile(channel, original)
-    except StreamProfile.DoesNotExist:
-        channel.stream_profile = None
-        channel.save(update_fields=["stream_profile"])
+        return obj.stream_profile
+    except Exception:
+        return None
+
+def _assign_profile(channel, profile, slot=None):
+    """Point the channel's effective stream profile at `profile` (None = system
+    default). Returns the slot written ("override" or "channel")."""
+    if slot == "override":
+        try:
+            obj = channel.override
+        except Exception:
+            obj, slot = channel, "channel"
+    elif slot == "channel":
+        obj = channel
+    else:
+        slot, obj = _eas_profile_slot(channel)
+    obj.stream_profile = profile
+    if slot == "override":
+        obj.save()
+    else:
+        obj.save(update_fields=["stream_profile"])
+    # NOTE: Channel.update_stream_profile() is NOT called here. Despite the name
+    # it moves the channel's M3U *account* connection slot to another M3U
+    # profile id; feeding it a StreamProfile id corrupted provider connection
+    # counts (or moved the slot to an unrelated account).
+    return slot
+
+def _restore_profile(channel, original_profile_id, slot=None):
+    from core.models import StreamProfile
+    original = None
+    if original_profile_id:
+        original = StreamProfile.objects.filter(id=original_profile_id).first()
+    # original None => restore to the system default profile.
+    _assign_profile(channel, original, slot=slot)
 
 def _delete_cloned_profile(profile_id):
     if not profile_id:
@@ -1071,7 +831,7 @@ def _eas_alert_texts(unique_alerts):
         return {}
 
     def _area(a):
-        return (a.get("area") or "").replace("; ", "  *  ").strip()
+        return (a.get("area") or "").replace("; ", "  ·  ").strip()
 
     def _is_nws(a):
         # NWS alerts (originator WXR) use the "* WHAT... * WHERE... * WHEN..."
@@ -1139,7 +899,7 @@ def _eas_alert_texts(unique_alerts):
             return fallback
         try:
             from datetime import datetime
-            dt = datetime.fromisoformat(iso_str)
+            dt = _eas_local_dt(datetime.fromisoformat(iso_str.strip().replace("Z", "+00:00")))
             time_str = dt.strftime("%I:%M %p").lstrip("0")
             return f"{dt.strftime('%m/%d')}  {time_str}"
         except Exception:
@@ -1158,9 +918,9 @@ def _eas_alert_texts(unique_alerts):
     else:
         event_text = " / ".join(a["event"].upper() for a in unique_alerts)
         area_text = "; ".join(_area(a) for a in unique_alerts if _area(a)) or "ALL AREAS"
-        headline_text = "   ***   ".join(_headline(a) for a in unique_alerts if _headline(a))
-        description_text = "   ***   ".join(_description(a) for a in unique_alerts if _description(a))
-        description_paras = "\n\n***\n\n".join(_description_paragraphs(a) for a in unique_alerts if _description_paragraphs(a))
+        headline_text = "   •••   ".join(_headline(a) for a in unique_alerts if _headline(a))
+        description_text = "   •••   ".join(_description(a) for a in unique_alerts if _description(a))
+        description_paras = "\n\n•••\n\n".join(_description_paragraphs(a) for a in unique_alerts if _description_paragraphs(a))
         instruction_text = "  ".join(_instruction(a) for a in unique_alerts if _instruction(a))
         sender_text = unique_alerts[0].get("sender") or "EAS Participant"
         effective_text = _fmt_time(unique_alerts[0].get("effective"), fallback="Now")
@@ -1169,9 +929,9 @@ def _eas_alert_texts(unique_alerts):
 
     scroll_text = f"{area_text}.  Effective Until {expires_text}"
     if headline_text:
-        scroll_text += f"     ***     {headline_text}"
+        scroll_text += f"     •••     {headline_text}"
     if description_text:
-        scroll_text += f"     ***     {description_text}"
+        scroll_text += f"     •••     {description_text}"
 
     # Plain-language sentence form for the TTS readout -- avoid the "|" / "•••"
     # scroll separators, which read aloud as awkward noise.
@@ -1201,118 +961,54 @@ def _eas_alert_texts(unique_alerts):
         "scroll": scroll_text, "spoken": spoken_text, "body": body_text,
     }
 
-def _eas_build_test_alert(mode, now_utc, area=None, originator=None):
-    """Build a realistic Required Weekly/Monthly Test alert dict, worded the way
-    a real EAS originator/encoder would -- e.g. "A Required Monthly Test has
-    been issued for the following counties..." -- rather than a placeholder
-    "Test Zone" message.
+def _eas_test_same_codes(settings=None):
+    """Location codes for plugin-originated tests and custom alerts, like the
+    list of counties a real station puts in its RMT header (more counties ->
+    a longer header): the "Locations in test headers" setting, else your
+    IPAWS county codes, else the counties of your NWS county zones, else the
+    whole US (000000)."""
+    from eaa_fips import zones_to_same
+    try:
+        st = settings if settings is not None else _get_settings()
+        for key in ("eas_test_locations", "eas_ipaws_same_codes"):
+            raw = (st.get(key) or "").replace(" ", "")
+            codes = [c for c in raw.split(",") if c.isdigit() and len(c) == 6]
+            if codes:
+                return codes[:31]
+        z = zones_to_same([x for x in (st.get("eas_zones") or "").split(",")])
+        return z[:31] or ["000000"]
+    except Exception:
+        return ["000000"]
 
-    mode: "weekly" -> RWT, anything else -> RMT
-    area: the location text to announce (defaults to the configured area or a
-          generic "this viewing area" when none is set)
-    originator: the sender name to display (defaults to "EAS Participant",
-          which is the standard originator code for station-originated tests)
-    """
-    is_weekly = (mode or "").lower() == "weekly"
-    test_label = "Required Weekly Test" if is_weekly else "Required Monthly Test"
-    sender = originator or "EAS Participant"
-    location = (area or "").strip() or "this viewing area"
-
-    # Worded like a genuine RWT/RMT script. RWTs are typically text/tone only
-    # and brief; RMTs include the spoken "this is a test" announcement.
-    if is_weekly:
-        headline = (
-            f"A {test_label} has been issued by {sender} for {location}. "
-            f"This is a test. No action is required."
-        )
-        instruction = (
-            "This is a Required Weekly Test of the Emergency Alert System. "
-            "This concludes this test."
-        )
-    else:
-        headline = (
-            f"A {test_label} has been issued by {sender} for {location}. "
-            f"This is only a test."
-        )
-        instruction = (
-            "This is a Required Monthly Test of the Emergency Alert System, "
-            "conducted by your local broadcasters and cable systems in "
-            "cooperation with the Federal Communications Commission. "
-            "If this had been an actual emergency, official messages would "
-            "have followed the alert tone. This concludes this test."
-        )
-
-    return {
-        "event":       test_label,
-        "area":        location,
-        "severity":    "Minor",
-        "effective":   now_utc.isoformat(),
-        "expires":     now_utc.isoformat(),   # caller overrides once duration is known
-        "headline":    headline,
-        "description": (
-            f"A {test_label} of the Emergency Alert System is in effect for "
-            f"{location} for the duration of this test message. "
-            f"No action is required."
-        ),
-        "instruction": instruction,
-        "sender":      sender,
-        # SAME fields for dynamic tone generation: RWT/RMT event code, EAS
-        # originator, and a few dummy county codes so the test button still
-        # produces a realistic multi-county header burst rather than a single
-        # entire-US code. (Real tests carry a short code list.)
-        "event_code":  "RWT" if is_weekly else "RMT",
-        "originator":  "EAS",
-        "same_codes":  ["040013", "040027", "040109"],
-    }
+def _eas_build_test_alert(mode, now_utc, area=None, originator=None, station_id=None):
+    """RMT/RWT as a real encoder originates it (see eaa_styles.eas_test_alert):
+    EAS Participant originator, the standard RMT script, valid for one hour
+    (RMT) or fifteen minutes (RWT). With no area text set, the county names
+    of the header's location codes are shown."""
+    from eaa_fips import describe_codes
+    codes = _eas_test_same_codes()
+    if not area and codes != ["000000"]:
+        area = describe_codes(codes) or None
+    return eas_test_alert(mode, now_utc, area=area, station_id=station_id, same_codes=codes)
 
 def _eas_write_alert(channel_id, unique_alerts, style="easyplus"):
-    """Write the EAS overlay text files for the given style. Returns the shared
-    texts dict (also needed for TTS) so callers don't have to recompute it."""
-    _ensure_dirs()
+    """Compatibility shim: overlay text files are now written by the style
+    builder when the alert profile is created. Returns the shared texts dict."""
     if not unique_alerts:
         return {}
-    # One alert on screen, always -- matches _clone_and_inject_eas.
-    unique_alerts = list(unique_alerts)[:1]
-    texts = _eas_alert_texts(unique_alerts)
-
-    if style == "dasdec":
-        # DASDEC: static paginated character-generator block (dd_l*/dd_pg* files).
-        block_lines = _eas_dasdec_block_lines(unique_alerts, texts)
-        _atomic_write(f"eas_{channel_id}_dd_title.txt", "Emergency Alert Details")
-        # Nominal duration -- the clone-time call writes the authoritative timing.
-        _eas_dasdec_pages(channel_id, block_lines, 60.0)
-    elif style == "dasdec_scroll":
-        # DASDEC scroll banner: a static label row + the DASDEC-form sentence as
-        # one scrolling line.
-        block_lines = _eas_dasdec_block_lines(unique_alerts, texts)
-        _atomic_write(f"eas_{channel_id}_dd_scroll_title.txt", "Emergency Alert Message")
-        _atomic_write(f"eas_{channel_id}_dd_scroll.txt", " ".join(block_lines))
-    elif style == "easyplus_ticker":
-        # Ticker-only: just the scrolling crawl line (reuses the ep_area file).
-        _atomic_write(f"eas_{channel_id}_ep_area.txt", texts["scroll"])
-    else:
-        # EASyPlus: black takeover with a scrolling crawl (ep_* files).
-        _atomic_write(f"eas_{channel_id}_ep_header.txt", "EMERGENCY ALERT SYSTEM")
-        _atomic_write(f"eas_{channel_id}_ep_area.txt",   texts["scroll"])
-        _atomic_write(f"eas_{channel_id}_ep_source.txt", texts.get("sender") or "EAS Participant")
-        _atomic_write(f"eas_{channel_id}_ep_issued.txt", "Issued a")
-        _atomic_write(f"eas_{channel_id}_ep_event.txt",  texts["event"])
-
-    return texts
+    return _eas_alert_texts(list(unique_alerts)[:1])
 
 def _eas_clear(channel_id):
+    """Remove this channel's overlay text files (all styles)."""
     _ensure_dirs()
-    for suffix in ("ep_header", "ep_area", "ep_source", "ep_issued", "ep_event"):
-        _atomic_write(f"eas_{channel_id}_{suffix}.txt", "")
-    # Remove DASDEC per-line, page-counter, and title files.
     import glob
-    for path in glob.glob(os.path.join(RUNTIME_DIR, f"eas_{channel_id}_dd_*.txt")):
+    for path in glob.glob(os.path.join(RUNTIME_DIR, f"eas_{channel_id}_*.txt")):
         try:
             os.remove(path)
         except Exception:
             pass
 
-def _restart_channel_stream(channel_uuid, label="", proactive=False):
+def _restart_channel_stream(channel_uuid, label="", proactive=False, channel_id=None):
     """Stop an active channel so clients reconnect with the updated stream profile.
 
     stop_channel() sets a Redis 'channel_stopping' key with a 60-second TTL.
@@ -1321,13 +1017,11 @@ def _restart_channel_stream(channel_uuid, label="", proactive=False):
     stall loop. We delete the key after ~2s (enough for FFmpeg teardown to finish)
     so clients can reconnect immediately with the new profile.
 
-    Note: the `proactive` parameter is accepted for call-site compatibility but is
-    intentionally a no-op. Earlier attempts to proactively re-initialize the channel
-    here (via ChannelService.initialize_channel) raced Dispatcharr's own teardown and
-    wedged the channel into an endless "teardown active" 503 loop. The reliable
-    approach — matching the original working EmergencyAlertarr — is to simply clear the gate and
-    let the client reconnect on its own; the reconnect-grace buffer on the restore
-    timer keeps the alert window open long enough to cover that reconnect.
+    proactive=True marks an alert being switched ON: once the stop succeeds a
+    short-lived Redis marker is left so the restore timer knows the old session
+    really ended (fast clients can reconnect between two restore ticks, and the
+    timer used to miss the down/up cycle and leave the alert screen up for an
+    extra ~90 s).
     """
     import time as _time
     tag = f" [{label}]" if label else ""
@@ -1337,18 +1031,40 @@ def _restart_channel_stream(channel_uuid, label="", proactive=False):
         from apps.channels.models import RedisClient
         rc = RedisClient.get_client()
         meta_key = RedisKeys.channel_metadata(channel_uuid)
-        deadline = _time.time() + 8.0
+        # Only wait while the channel is still starting up; any running state
+        # (including "buffering", which a live provider stream drops into
+        # whenever it dips below 1.0x) can be stopped right away. Waiting for
+        # exactly "active" used to add up to 8 s of dead air per switch.
+        deadline = _time.time() + 5.0
         while _time.time() < deadline:
             raw = rc.hget(meta_key, "state")
             state_val = (raw.decode() if isinstance(raw, bytes) else raw) if raw else ""
-            if state_val == "active":
+            if state_val not in ("initializing", "connecting"):
                 break
-            _time.sleep(0.25)
+            _time.sleep(0.2)
         result = ChannelService.stop_channel(channel_uuid)
         if result.get("status") != "success":
             return
+        if proactive and channel_id is not None:
+            try:
+                rc.setex(f"{_EAS_STOPPED_PREFIX}{channel_id}", 300, str(_time.time()))
+            except Exception:
+                pass
+        # Newer Dispatcharr deletes its own stop marker (with the rest of the
+        # channel's Redis keys) within milliseconds of stop_channel(). Players
+        # attached through OTHER uWSGI workers only check for that marker once
+        # a second, so they could miss it, sit on a frozen picture for ~15 s
+        # until a data timeout, and reconnect long after the alert started
+        # (or never see it). Hold the marker for a moment so every worker
+        # drops its players right away, and so the old session's stream thread
+        # has finished before the new one (the alert) starts; players retry on
+        # the 503 + Retry-After: 1 meanwhile.
+        try:
+            rc.setex(RedisKeys.channel_stopping(channel_uuid), 15, "true")
+        except Exception:
+            pass
+        _time.sleep(2.5)
         rc.delete(RedisKeys.channel_stopping(channel_uuid))
-        meta_key = RedisKeys.channel_metadata(channel_uuid)
         state_raw = rc.hget(meta_key, "state")
         state_val = (state_raw.decode() if isinstance(state_raw, bytes) else state_raw) if state_raw else ""
         if state_val == "stopping":
@@ -1357,21 +1073,21 @@ def _restart_channel_stream(channel_uuid, label="", proactive=False):
     except ImportError:
         logger.warning(f"emergencyalertarr:{tag} live_proxy unavailable — profile will apply on next client connect")
     except Exception as e:
-        logger.debug(f"emergencyalertarr:{tag} restart {channel_uuid}: {e}")
+        logger.warning(f"emergencyalertarr:{tag} restart {channel_uuid} failed: {e}")
 
 def _restart_channel_stream_async(channel, label="", proactive=False):
     """Non-blocking wrapper — runs _restart_channel_stream in a daemon thread so the 2s sleep never blocks the caller."""
     import threading as _threading
     _threading.Thread(
         target=_restart_channel_stream,
-        args=(str(channel.uuid), label, proactive),
+        args=(str(channel.uuid), label, proactive, str(channel.id)),
         daemon=True,
     ).start()
 
 def _eas_restart_channel(channel_uuid):
     _restart_channel_stream(channel_uuid, label="EAS")
 
-_EMERGENCYALERTARR_EAS_BUILD = "2026-07-02 EAS-only private edition"
+_EMERGENCYALERTARR_EAS_BUILD = "2026-10-14 v0.9.10 (alert follows its own session; no early switch-back)"
 
 _EAS_MAX_SPOKEN_CHARS = 1400
 
@@ -1381,7 +1097,17 @@ _eas_active     = {}
 
 _eas_lock       = threading.Lock()
 
-_eas_seen_mem   = {"init": False, "ids": set()}
+_eas_seen_mem   = {"init": False, "ids": {}}
+
+_eas_last_end_mem = {"ts": 0.0}
+
+_eas_clone_mem  = set()
+
+_eas_tick_count = {"n": 0}
+
+_eas_sched_mem  = {"last": None}
+
+_eas_json_mem   = {}
 
 _TICKER_FIXED_LEN = 600
 
@@ -1401,13 +1127,64 @@ _EAS_GLOBAL_KEY   = f"emergencyalertarr:{_PLUGIN_KEY}:eas_global_announced"
 
 _EAS_SEEN_KEY     = f"emergencyalertarr:{_PLUGIN_KEY}:eas_seen"
 
-_EAS_SEEN_TTL     = 6 * 3600
+_EAS_SEEN_TTL     = 24 * 3600
+
+# How long an announced alert is remembered after it leaves the feed.
+_EAS_SEEN_KEEP    = 12 * 3600
+
+# One lock for every read-modify-write of mappings.json (see _EasMutex).
+_EAS_MUTEX_KEY    = f"emergencyalertarr:{_PLUGIN_KEY}:eas_mutex"
+
+_EAS_MUTEX_TTL    = 120
+
+# Set by _restart_channel_stream when an alert switch-on stop succeeded.
+_EAS_STOPPED_PREFIX = f"emergencyalertarr:{_PLUGIN_KEY}:eas_stopped:"
 
 _EAS_SCHED_KEY    = f"emergencyalertarr:{_PLUGIN_KEY}:eas_sched_last"
 
 _EAS_SCHED_LOCK   = f"emergencyalertarr:{_PLUGIN_KEY}:eas_sched_lock"
 
 _EAS_HISTORY_KEY  = f"emergencyalertarr:{_PLUGIN_KEY}:eas_history"
+
+# Fingerprint of the alert-area settings the seen set was seeded for.
+_EAS_CFG_FP_KEY   = f"emergencyalertarr:{_PLUGIN_KEY}:eas_cfg_fp"
+
+# When the last alert finished (epoch secs) -- spacing between alerts.
+_EAS_LAST_END_KEY = f"emergencyalertarr:{_PLUGIN_KEY}:eas_last_end"
+
+# Alert profile ids this plugin created recently (stale-stream watchdog).
+_EAS_CLONES_KEY   = f"emergencyalertarr:{_PLUGIN_KEY}:eas_clone_ids"
+
+_EAS_WD_PREFIX    = f"emergencyalertarr:{_PLUGIN_KEY}:eas_wd:"
+
+# Alerts waiting out a timed-relay hold ({key: {"first": ts, "hold": min}}).
+_EAS_PENDING_KEY  = f"emergencyalertarr:{_PLUGIN_KEY}:eas_pending"
+
+# Recently received alerts by SAME identity (cross-source duplicate check).
+_EAS_RECENT_KEY   = f"emergencyalertarr:{_PLUGIN_KEY}:eas_recent"
+
+# The national alert (EAN) currently holding the channels, if any.
+_EAS_NATIONAL_KEY = f"emergencyalertarr:{_PLUGIN_KEY}:eas_national"
+
+# Alerts decoded from a monitored channel's audio (list, newest last).
+_EAS_MONITOR_KEY  = f"emergencyalertarr:{_PLUGIN_KEY}:eas_monitor_alerts"
+
+_EAS_MONITOR_STATUS_KEY = f"emergencyalertarr:{_PLUGIN_KEY}:eas_monitor_status"
+
+# The alert that just went out, for viewers who tune in during the next few seconds.
+_EAS_JOIN_KEY     = f"emergencyalertarr:{_PLUGIN_KEY}:eas_join_window"
+
+_EAS_JOIN_SECS    = 5.0
+# The alert "airs" system-wide for its length whether or not anyone is
+# watching: an alert nobody saw is NOT saved up for the next channel someone
+# tunes to, and the next queued alert waits for this one's slot to end.
+_EAS_AIR_KEY      = f"emergencyalertarr:{_PLUGIN_KEY}:eas_air"
+_EAS_UNWATCHED_AIR_SECS = 60.0      # slot length when it went out to nobody
+# A channel whose viewer left mid-alert is put back right away (after the
+# switch-on reconnect has had time to happen), so flipping back later shows
+# the normal channel instead of the alert.
+_EAS_LEFT_MIN_AGE = 12.0
+_EAS_LEFT_GRACE   = 15.0
 
 _EAS_HISTORY_FILE = os.path.join(_DATA_DIR, "eas_history.json")
 
@@ -1421,93 +1198,23 @@ _EAS_POST_RESUME_GRACE = 3.0
 
 _EAS_MAX_RECONNECT_WAIT = 90.0
 
-_EAS_TICK_SECS = 3
+# Hard limit, from the moment an alert fires, after which its channel is
+# restored no matter what state the restore bookkeeping is in.
+_EAS_HARD_DEADLINE_EXTRA = 150.0
+
+# The alert FFmpeg process itself exits this long after its sequence (-t),
+# so a channel whose restart was missed cannot sit on the alert forever.
+_EAS_PROC_CAP_EXTRA = 240.0
+
+# Alert-flow guards (settings can override the first two).
+_EAS_DEFAULT_GAP_SECS = 60          # quiet time between two alerts
+_EAS_ALL_MODE_GAP_SECS = 300        # ... when watching the whole country ("ALL")
+_EAS_DEFAULT_MAX_AGE_MIN = 20       # alerts older than this are never announced
+_EAS_WATCHDOG_EVERY = 15            # restore ticks between watchdog passes
+
+_EAS_TICK_SECS = 2
 
 _EAS_LOGGED_CHANSERVICE_API = False
-
-# --- FCC-style EAS log + webhook notifications -----------------------------
-_EAS_LOG_FILE = os.path.join(_DATA_DIR, "eas_fcc_log.csv")
-_EAS_LOG_MAX_ROWS = 2000
-_eas_log_lock = threading.Lock()
-
-
-def _eas_log_event(action, event="", severity="", area="", channels="", note=""):
-    """Append one row to the FCC-style EAS log (eas_fcc_log.csv): an append-only
-    record of every alert action -- FIRED / TEST / INJECT / RESTORED -- with when,
-    what, and where. Trimmed to the most recent rows. Best-effort; never raises."""
-    try:
-        from datetime import datetime
-        _ensure_dirs()
-        chans = channels if isinstance(channels, str) else ",".join(str(c) for c in (channels or []))
-        cells = [
-            datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
-            action or "", event or "", severity or "", (area or "")[:120], chans, note or "",
-        ]
-        line = ",".join('"' + str(c).replace('"', "'") + '"' for c in cells) + "\n"
-        header = "timestamp,action,event,severity,area,channels,note\n"
-        with _eas_log_lock:
-            new_file = not os.path.exists(_EAS_LOG_FILE)
-            with open(_EAS_LOG_FILE, "a", encoding="utf-8") as f:
-                if new_file:
-                    f.write(header)
-                f.write(line)
-            try:
-                with open(_EAS_LOG_FILE, encoding="utf-8") as f:
-                    rows = f.readlines()
-                if len(rows) > _EAS_LOG_MAX_ROWS + 1:
-                    with open(_EAS_LOG_FILE, "w", encoding="utf-8") as f:
-                        f.write(rows[0])
-                        f.writelines(rows[-_EAS_LOG_MAX_ROWS:])
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning(f"[EmergencyAlertarr] FCC log write failed: {e}")
-
-
-def _eas_notify(kind, text):
-    """Fire-and-forget push to a configured Discord / ntfy / generic webhook when
-    an alert fires ('fire') or clears ('clear'). Runs in a background thread so a
-    slow endpoint can't stall an alert; failures are logged, never raised."""
-    try:
-        settings = _get_settings()
-    except Exception:
-        return
-    if str(settings.get("eas_notify_enabled")).strip().lower() not in ("true", "1", "yes", "on"):
-        return
-    url = (settings.get("eas_webhook_url") or "").strip()
-    if not url:
-        return
-    which = (settings.get("eas_notify_events") or "both").strip().lower()
-    if (which == "fire" and kind != "fire") or (which == "clear" and kind != "clear"):
-        return
-
-    def _send():
-        try:
-            import urllib.request
-            u = url.lower()
-            if "discord.com/api/webhooks" in u or "discordapp.com/api/webhooks" in u:
-                body = json.dumps({"content": text[:1900]}).encode("utf-8")
-                req = urllib.request.Request(url, data=body,
-                                             headers={"Content-Type": "application/json"})
-            elif "ntfy" in u:
-                req = urllib.request.Request(
-                    url, data=text.encode("utf-8"),
-                    headers={"Title": "EmergencyAlertarr",
-                             "Priority": "urgent" if kind == "fire" else "default",
-                             "Content-Type": "text/plain"})
-            else:
-                body = json.dumps({"text": text}).encode("utf-8")
-                req = urllib.request.Request(url, data=body,
-                                             headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=8).read(200)
-        except Exception as e:
-            logger.warning(f"[EmergencyAlertarr] webhook notify failed: {e}")
-
-    try:
-        threading.Thread(target=_send, daemon=True).start()
-    except Exception:
-        _send()
-
 
 def _eas_history_read():
     """Return the recent-alert history as a list (most recent first). Prefers
@@ -1544,13 +1251,6 @@ def _eas_history_add(event, area, channels, kind="alert", severity=""):
             "severity": severity or "",
         }
         hist = _eas_history_read()
-        _chan_list = channels if isinstance(channels, list) else [channels]
-        # FCC-style log: record every fire action (per channel).
-        _eas_log_event(
-            {"alert": "FIRED", "test": "TEST", "manual": "INJECT"}.get(kind, kind.upper()),
-            event=event or "Alert", severity=severity or "", area=area or "",
-            channels=", ".join(str(c) for c in _chan_list),
-        )
         # Light dedup: collapse an identical event+kind fired within 5s (e.g.
         # the same alert hitting several channels in one sweep) into one entry
         # with the channel list merged, rather than spamming the log.
@@ -1573,12 +1273,6 @@ def _eas_history_add(event, area, channels, kind="alert", severity=""):
         hist.insert(0, entry)
         hist = hist[:_EAS_HISTORY_MAX]
         _eas_history_write(hist)
-        # Notify once per new alert (merged repeats above already returned).
-        _label = {"alert": "EAS Alert", "test": "EAS Test", "manual": "EAS (manual)"}.get(kind, "EAS")
-        _sev = f" [{severity}]" if severity else ""
-        _eas_notify("fire", f"\U0001F6A8 {_label}: {event or 'Alert'}{_sev}"
-                    + (f" — {area}" if area else "")
-                    + f" — on {', '.join(str(c) for c in _chan_list)}")
     except Exception as e:
         logger.warning(f"[EmergencyAlertarr] EAS: failed to record history: {e}")
 
@@ -1625,133 +1319,522 @@ def _eas_sequence_duration(silence_secs):
     )
 
 def _eas_alert_fingerprint(alerts):
-    """Stable string key for a set of alerts. Changes when alert IDs change --
-    a new or different alert gets a new fingerprint and triggers a fresh
-    broadcast even if NWS is still returning active alerts."""
+    """Stable string key for a set of alerts (kept for diagnostics)."""
     ids = sorted(a.get("id", "") for a in alerts)
     return "|".join(ids) if ids else ""
 
-def _eas_seen_write(rc, ids):
-    """Persist the set of already-announced alert IDs (Redis, or in-process
-    fallback). Refreshes the TTL so the set stays alive as long as sweeps run."""
-    clean = sorted(x for x in ids if x)
+# ---------------------------------------------------------------------------
+# Cross-worker mutex
+# ---------------------------------------------------------------------------
+# Dispatcharr runs several worker processes and every one of them runs this
+# plugin's poller (sweep + fast restore tick), plus UI actions run in whichever
+# worker served the request. All of them read-modify-write mappings.json. They
+# used to do that under different locks (or none), so one worker could save a
+# stale copy over another's fresh write: an alert that just fired lost its
+# restore timer (channel stuck on the alert profile), or a restore was undone.
+# Every mapping mutation now happens under this one lock, and the mappings are
+# re-read after it is acquired.
+
+_eas_local_mutex = threading.Lock()
+
+_EAS_MUTEX_RELEASE_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+
+class _EasMutex:
+    """`with _EasMutex(rc, wait=s) as held:` -- held is True when the lock was
+    acquired within `wait` seconds. Not re-entrant: never nest it."""
+
+    def __init__(self, rc=None, wait=0.0, ttl=None):
+        self.rc = rc if rc is not None else _get_redis_client()
+        self.wait = max(0.0, float(wait or 0))
+        self.ttl = int(ttl or _EAS_MUTEX_TTL)
+        self.token = f"{os.getpid()}:{threading.get_ident()}:{time.time()}"
+        self.held = False
+        self._local = False
+
+    def __enter__(self):
+        deadline = time.time() + self.wait
+        if self.rc is None:
+            self.held = _eas_local_mutex.acquire(timeout=self.wait if self.wait > 0 else 0.01)
+            self._local = self.held
+            return self.held
+        while True:
+            try:
+                if self.rc.set(_EAS_MUTEX_KEY, self.token, nx=True, ex=self.ttl):
+                    self.held = True
+                    _eas_mutex_tls.held = (self.rc, self.token, self.ttl)
+                    return True
+            except Exception as e:
+                logger.warning(f"[EmergencyAlertarr] EAS: mutex unavailable ({e}); continuing unlocked")
+                self.held = True
+                self.rc = None
+                return True
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.25)
+
+    def __exit__(self, *exc):
+        if not self.held:
+            return False
+        _eas_mutex_tls.held = None
+        if self._local:
+            try:
+                _eas_local_mutex.release()
+            except Exception:
+                pass
+        elif self.rc is not None:
+            try:
+                self.rc.eval(_EAS_MUTEX_RELEASE_LUA, 1, _EAS_MUTEX_KEY, self.token)
+            except Exception:
+                try:
+                    self.rc.delete(_EAS_MUTEX_KEY)
+                except Exception:
+                    pass
+        self.held = False
+        return False
+
+_eas_mutex_tls = threading.local()
+
+def _eas_mutex_touch():
+    """Extend the mutex TTL while this thread holds it -- called between slow
+    steps (preroll capture, audio render, one channel after another) so a long
+    activation can never outlive the lock and let a second worker fire the
+    same alert."""
+    h = getattr(_eas_mutex_tls, "held", None)
+    if not h:
+        return
+    rc, token, ttl = h
+    try:
+        v = rc.get(_EAS_MUTEX_KEY)
+        v = v.decode() if isinstance(v, bytes) else v
+        if v == token:
+            rc.expire(_EAS_MUTEX_KEY, int(ttl))
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# Already-announced ("seen") set
+# ---------------------------------------------------------------------------
+# {alert key -> last time it was present in the feed}. Keys are the merged
+# content ID plus the raw NWS/IPAWS identifiers. Entries are kept for
+# _EAS_SEEN_KEEP after the alert leaves the feed, instead of being dropped the
+# moment one poll doesn't contain them -- a single failed/partial fetch used to
+# wipe the set and make every still-active alert play again.
+
+def _eas_seen_read(rc):
+    """dict of seen keys, or None if the set has never been initialised."""
+    raw = None
+    if rc:
+        try:
+            raw = rc.get(_EAS_SEEN_KEY)
+        except Exception:
+            raw = None
+        if raw is None:
+            return None
+    else:
+        if not _eas_seen_mem["init"]:
+            return None
+        return dict(_eas_seen_mem["ids"])
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return {}
+    now = time.time()
+    if isinstance(data, dict):
+        out = {}
+        for k, v in data.items():
+            try:
+                out[k] = float(v)
+            except Exception:
+                out[k] = now
+        return out
+    if isinstance(data, list):           # legacy format: plain list of IDs
+        return {k: now for k in data if k}
+    return {}
+
+def _eas_seen_write(rc, seen):
+    """Persist the seen set (Redis, or in-process fallback)."""
+    if not isinstance(seen, dict):
+        now = time.time()
+        seen = {k: now for k in (seen or []) if k}
+    clean = {k: v for k, v in seen.items() if k}
     if rc:
         try:
             rc.setex(_EAS_SEEN_KEY, _EAS_SEEN_TTL, json.dumps(clean))
             return
         except Exception:
             pass
-    _eas_seen_mem["ids"] = set(clean)
+    _eas_seen_mem["ids"] = dict(clean)
     _eas_seen_mem["init"] = True
 
 def _eas_streaming_ids(rc=None):
-    """Set of channel IDs currently being streamed (Redis channel_stream:* keys)."""
+    """Armed channel IDs someone is actually watching right now.
+
+    Uses Dispatcharr's live-proxy client registry (live:channel:<uuid>:clients
+    plus each client's heartbeat-refreshed record). The old check used the
+    channel_stream:<n> keys, but those also exist for stream IDs (stream
+    previews, M3U slot bookkeeping) and can be left behind after a crash -- so
+    with every channel armed, an alert fired on hundreds of channels nobody
+    was watching. Our own frame grabs / channel monitor don't count."""
     rc = rc or _get_redis_client()
     ids = set()
+    if not rc:
+        return ids
+    try:
+        umap = _get_uuid_to_id_map(_get_mappings())
+    except Exception:
+        umap = {}
+    if not umap:
+        return ids
+    try:
+        keys = list(rc.scan_iter("live:channel:*:clients", count=1000))
+    except Exception:
+        try:
+            keys = rc.keys("live:channel:*:clients")
+        except Exception:
+            keys = []
+    for raw in keys:
+        k = raw.decode() if isinstance(raw, bytes) else raw
+        parts = k.split(":")
+        if len(parts) != 4:
+            continue
+        cid = umap.get(parts[2].lower())
+        if cid is None:
+            continue
+        try:
+            members = rc.smembers(k) or []
+        except Exception:
+            continue
+        for m in members:
+            m = m.decode() if isinstance(m, bytes) else m
+            try:
+                ua = rc.hget(f"live:channel:{parts[2]}:clients:{m}", "user_agent")
+            except Exception:
+                ua = None
+            if ua is None:
+                continue                      # stale entry (record expired)
+            ua = ua.decode() if isinstance(ua, bytes) else str(ua)
+            if ua.startswith("EmergencyAlertarr/"):
+                continue                      # our own frame grab / monitor
+            ids.add(str(cid))
+            break
+    return ids
+
+def _eas_pop_stopped(rc, cid):
+    """True (and clears it) if the alert switch-on left a 'stream stopped' marker."""
+    if not rc:
+        return False
+    try:
+        return bool(rc.delete(f"{_EAS_STOPPED_PREFIX}{cid}"))
+    except Exception:
+        return False
+
+def _eas_state_set(rc, cid, value):
+    """Update one channel's entry in the shared EAS state hash (best-effort)."""
+    if not rc:
+        return
+    try:
+        raw = rc.get(_EAS_STATE_KEY)
+        st = json.loads(raw) if raw else {}
+        if value is None:
+            st.pop(str(cid), None)
+        else:
+            st[str(cid)] = value
+        rc.setex(_EAS_STATE_KEY, 3600, json.dumps(st))
+    except Exception:
+        pass
+
+def _eas_do_restore(cid, mapping, mappings, rc=None):
+    """Restore one channel's normal profile and clear all EAS state.
+
+    Every step is independent: a failure in one (DB hiccup, a deleted override
+    row, a stream-restart error) is logged but never leaves the channel's EAS
+    bookkeeping behind. Previously an exception here kept the channel marked
+    busy, so the restore was retried and failed forever and every channel sat
+    on the alert screen."""
+    eas_pid = mapping.get("eas_profile_id") or mapping.get("ticker_profile_id")
+    channel = None
+    try:
+        from apps.channels.models import Channel as _Ch
+        channel = _Ch.objects.filter(id=int(cid)).first()
+    except Exception as e:
+        logger.error(f"[EmergencyAlertarr] EAS: restore ch {cid}: channel lookup failed: {e}")
+    if channel:
+        try:
+            _restore_profile(channel, mapping.get("original_profile_id"), slot=mapping.get("eas_slot"))
+        except Exception as e:
+            logger.error(f"[EmergencyAlertarr] EAS: restore ch {cid}: profile restore failed: {e}")
+            try:
+                _assign_profile(channel, None, slot=mapping.get("eas_slot"))   # system default
+            except Exception:
+                pass
+        try:
+            _restart_channel_stream_async(channel, label="EAS restore")
+        except Exception as e:
+            logger.error(f"[EmergencyAlertarr] EAS: restore ch {cid}: stream restart failed: {e}")
+    if eas_pid:
+        _eas_clone_remember(rc, eas_pid)       # watchdog: catch a stream still on it
+        _delete_cloned_profile(eas_pid)
+    _eas_delete_passthrough(mapping.get("eas_passthrough_id"))
+    _eas_armed_clear(rc, cid)
+    for k in ("eas_profile_id", "ticker_profile_id", "eas_restore_at", "eas_await_stream",
+              "eas_seen_down", "eas_seq_secs", "eas_slot", "eas_hard_deadline", "eas_fired_at",
+              "eas_national", "eas_priority", "eas_returned", "eas_tag", "eas_stream_end",
+              "eas_return_profile_id", "eas_passthrough_id", "eas_gone_since"):
+        mapping.pop(k, None)
+    mappings[cid] = mapping
+    for fn in (lambda: _eas_clear(cid), lambda: _eas_pop_stopped(rc, cid),
+               lambda: _eas_state_set(rc, cid, None)):
+        try:
+            fn()
+        except Exception:
+            pass
+    with _eas_lock:
+        _eas_active.pop(cid, None)
+    _eas_mark_alert_end(rc)
+    logger.info(f"[EmergencyAlertarr] EAS: sequence complete, restored ch {cid}")
+
+def _eas_mark_alert_end(rc, ts=None):
+    """Remember when the last alert finished (spacing between alerts)."""
+    ts = float(ts or time.time())
+    _eas_last_end_mem["ts"] = ts
     if rc:
         try:
-            for k in rc.keys("channel_stream:*"):
-                ids.add((k if isinstance(k, str) else k.decode()).split(":")[-1])
+            rc.setex(_EAS_LAST_END_KEY, 6 * 3600, str(ts))
+        except Exception:
+            pass
+
+def _eas_last_end(rc):
+    if rc:
+        try:
+            v = rc.get(_EAS_LAST_END_KEY)
+            if v:
+                return float(v.decode() if isinstance(v, bytes) else v)
+        except Exception:
+            pass
+    return float(_eas_last_end_mem.get("ts") or 0.0)
+
+def _eas_clone_remember(rc, pid):
+    """Keep a short record of alert profile ids so the watchdog can tell when a
+    live session is still running one after its channel was restored."""
+    if not pid:
+        return
+    _eas_clone_mem.add(str(pid))
+    if rc:
+        try:
+            rc.sadd(_EAS_CLONES_KEY, str(pid))
+            rc.expire(_EAS_CLONES_KEY, 24 * 3600)
+        except Exception:
+            pass
+
+def _eas_clone_ids(rc):
+    ids = set(_eas_clone_mem)
+    if rc:
+        try:
+            for v in rc.smembers(_EAS_CLONES_KEY) or []:
+                ids.add(v.decode() if isinstance(v, bytes) else str(v))
         except Exception:
             pass
     return ids
 
-def _eas_do_restore(cid, mapping, mappings):
-    """Restore one channel's passthrough profile and clear all EAS state."""
-    from apps.channels.models import Channel as _Ch
-    channel = _Ch.objects.filter(id=int(cid)).first()
-    eas_pid = mapping.get("eas_profile_id")
-    if channel:
-        _restore_profile(channel, mapping.get("original_profile_id"))
-        _restart_channel_stream_async(channel, label="EAS")
-    if eas_pid:
-        _delete_cloned_profile(eas_pid)
-    for k in ("eas_profile_id", "eas_restore_at", "eas_await_stream",
-              "eas_seen_down", "eas_seq_secs"):
-        mapping.pop(k, None)
-    mappings[cid] = mapping
-    _eas_clear(cid)
-    with _eas_lock:
-        _ev = _eas_active.get(cid, "")
-        _eas_active.pop(cid, None)
-    _cname = channel.name if channel else str(cid)
-    _eas_log_event("RESTORED", event=_ev or "", channels=_cname, note="alert cleared")
-    _eas_notify("clear", f"\u2705 EAS cleared" + (f": {_ev}" if _ev else "") + f" — on {_cname}")
-    logger.info(f"[EmergencyAlertarr] EAS: sequence complete, restored ch {cid}")
+def restore_due_national(mapping, now_ts):
+    try:
+        return now_ts >= float(mapping.get("eas_restore_at") or 0) or \
+            now_ts >= float(mapping.get("eas_hard_deadline") or 0)
+    except Exception:
+        return False
 
-def _eas_process_restores(mappings, streaming_ids, now_ts):
+def _eas_process_restores(mappings, streaming_ids, now_ts, rc=None):
     """Anchor each pending alert's restore countdown to actual stream resumption
-    (wait for the channel to go DOWN after firing, then come back UP), and
-    restore any channel whose sequence has finished. Returns True if changed.
+    (the channel goes DOWN when the alert switches on, then comes back UP on the
+    alert profile), and restore any channel whose sequence has finished.
+    Returns True if anything changed.
 
-    This fixes the timing bug where the restore counted from fire time: the
-    channel-stop -> client-reconnect gap is highly variable (20s+), so counting
-    from fire could restore before the overlay was ever seen. We instead start
-    the countdown the moment the viewer's stream is actually back on screen."""
+    "Down" is detected either by the channel dropping out of the streaming set
+    or by the marker _restart_channel_stream leaves once its stop succeeded --
+    a fast client can reconnect between two ticks, and without the marker the
+    down/up cycle was missed and the alert screen sat there until the ~90 s
+    safety timeout."""
     changed = False
-    pending = [c for c, m in mappings.items()
-               if m.get("eas_await_stream") or m.get("eas_restore_at")]
-    for cid in pending:
-        mapping = mappings.get(cid, {})
-        restore_at = mapping.get("eas_restore_at")
+    for cid, mapping in list(mappings.items()):
+        if not isinstance(mapping, dict):
+            continue
+        if mapping.get("eas_passthrough_id") and not mapping.get("eas_profile_id"):
+            if _eas_passthrough_cleanup(cid, mapping, mappings, streaming_ids):
+                changed = True
+            continue
+        if not (mapping.get("eas_await_stream") or mapping.get("eas_restore_at")):
+            continue
+        hard = mapping.get("eas_hard_deadline")
+        if hard is None:
+            # Armed by an older version: give it one from now.
+            seq = float(mapping.get("eas_seq_secs") or 60.0)
+            hard = now_ts + seq + _EAS_HARD_DEADLINE_EXTRA
+            mapping["eas_hard_deadline"] = hard
+            mappings[cid] = mapping
+            changed = True
+        if mapping.get("eas_national") and restore_due_national(mapping, now_ts):
+            _eas_json_del(rc, _EAS_NATIONAL_KEY)
+        if now_ts >= float(hard):
+            logger.warning(f"[EmergencyAlertarr] EAS: hard deadline reached on ch {cid} -- forcing restore")
+            _eas_do_restore(cid, mapping, mappings, rc)
+            changed = True
+            continue
+        # Only once the alert has actually been playing (the arm watcher saw it
+        # start): a player that is slow to reconnect after the switch must not
+        # lose the alert before it ever got it.
+        if (mapping.get("eas_profile_id") and not mapping.get("eas_national")
+                and (mapping.get("eas_returned") or _eas_armed_get(rc, cid))
+                and now_ts - float(mapping.get("eas_fired_at") or now_ts) >= _EAS_LEFT_MIN_AGE):
+            if cid in streaming_ids:
+                if mapping.pop("eas_gone_since", None) is not None:
+                    mappings[cid] = mapping
+                    changed = True
+            else:
+                gone = mapping.get("eas_gone_since")
+                if gone is None:
+                    mapping["eas_gone_since"] = now_ts
+                    mappings[cid] = mapping
+                    changed = True
+                elif now_ts - float(gone) >= _EAS_LEFT_GRACE:
+                    logger.info(f"[EmergencyAlertarr] EAS: nobody is watching ch {cid} any more -- "
+                                f"alert taken off it")
+                    _eas_do_restore(cid, mapping, mappings, rc)
+                    changed = True
+                    continue
         if mapping.get("eas_await_stream"):
-            if cid not in streaming_ids:
-                # Channel has gone down as expected after the profile swap.
-                if not mapping.get("eas_seen_down"):
+            restore_at = mapping.get("eas_restore_at")
+            if restore_at and now_ts >= float(restore_at):
+                # Safety timeout: the viewer never came back on the alert profile.
+                try:
+                    _eas_do_restore(cid, mapping, mappings, rc)
+                    changed = True
+                except Exception as e:
+                    logger.error(f"[EmergencyAlertarr] EAS: safety restore failed ch {cid}: {e}", exc_info=True)
+                continue
+            armed = _eas_armed_get(rc, cid) if not mapping.get("eas_national") else None
+            if (armed and armed.get("tag") == mapping.get("eas_tag") and mapping.get("eas_stream_end")
+                    and armed.get("neutralized", True)):
+                started = float(armed.get("ts") or now_ts)
+                mapping.pop("eas_await_stream", None)
+                mapping.pop("eas_seen_down", None)
+                mapping["eas_returned"] = True
+                mapping["eas_restore_at"] = started + float(mapping["eas_stream_end"]) + 12
+                mappings[cid] = mapping
+                changed = True
+                logger.info(f"[EmergencyAlertarr] EAS: overlay live on ch {cid} -- back to the channel "
+                            f"in {max(0.0, started + float(mapping['eas_stream_end']) - now_ts):.0f}s "
+                            f"(seamless)")
+                continue
+            if not mapping.get("eas_seen_down"):
+                if cid not in streaming_ids or _eas_pop_stopped(rc, cid):
                     mapping["eas_seen_down"] = True
                     mappings[cid] = mapping
                     changed = True
-            elif mapping.get("eas_seen_down"):
-                # Stream is back UP with the overlay -> start the real countdown.
-                seq = float(mapping.get("eas_seq_secs") or 30.0)
-                mapping["eas_restore_at"] = now_ts + seq + _EAS_POST_RESUME_GRACE
+                continue   # countdown starts on a later tick, once it is back up
+            if cid in streaming_ids and mapping.get("eas_national"):
                 mapping.pop("eas_await_stream", None)
                 mapping.pop("eas_seen_down", None)
                 mappings[cid] = mapping
                 changed = True
-                logger.info(
-                    f"[EmergencyAlertarr] EAS: overlay live on ch {cid} -- "
-                    f"restoring in {seq + _EAS_POST_RESUME_GRACE:.0f}s"
-                )
+                logger.info(f"[EmergencyAlertarr] EAS: national alert live on ch {cid} -- holding")
                 continue
-            # SAFETY NET: a channel that fired but never got a viewer never goes
-            # down/up, so it would otherwise stay armed forever. Once the safety
-            # deadline (set at fire time) passes, restore it anyway so a test or
-            # alert can never get stuck on an unwatched channel.
-            if restore_at and now_ts >= float(restore_at):
-                try:
-                    _eas_do_restore(cid, mapping, mappings)
-                    changed = True
-                    logger.info(f"[EmergencyAlertarr] EAS: safety-restored ch {cid} (viewer never returned)")
-                except Exception as e:
-                    logger.error(f"[EmergencyAlertarr] EAS: safety restore failed ch {cid}: {e}", exc_info=True)
+            if cid in streaming_ids:
+                seq = float(mapping.get("eas_seq_secs") or 30.0)
+                mapping.pop("eas_await_stream", None)
+                mapping.pop("eas_seen_down", None)
+                armed = False
+                fired = float(mapping.get("eas_fired_at") or 0)
+                if mapping.get("eas_stream_end") and mapping.get("eas_profile_id"):
+                    # The arm watcher follows the alert session and switches it
+                    # back near the end. Neutralizing here, the moment the
+                    # viewer showed up again, raced Dispatcharr starting the
+                    # alert session: a player that reconnected slowly (TiviMate)
+                    # got the normal stream back instead of the alert.
+                    a2 = _eas_armed_get(rc, cid)
+                    if not (a2 and a2.get("tag") == mapping.get("eas_tag")):
+                        if now_ts - fired < 120:
+                            mapping["eas_await_stream"] = True
+                            mapping["eas_seen_down"] = True
+                            mappings[cid] = mapping
+                            continue
+                        # Never confirmed: fall back to a timed stop/restart.
+                    else:
+                        mapping["eas_await_stream"] = True
+                        mapping["eas_seen_down"] = True
+                        mappings[cid] = mapping
+                        continue
+                if armed:
+                    # The alert stream ends itself at eas_stream_end; tidy up a
+                    # little after that.
+                    mapping["eas_restore_at"] = max(fired, now_ts - 10) + float(mapping["eas_stream_end"]) + 12
+                    logger.info(f"[EmergencyAlertarr] EAS: overlay live on ch {cid} -- back to the "
+                                f"channel in {float(mapping['eas_stream_end']):.0f}s (seamless)")
+                else:
+                    mapping["eas_restore_at"] = now_ts + seq + _EAS_POST_RESUME_GRACE
+                    logger.info(
+                        f"[EmergencyAlertarr] EAS: overlay live on ch {cid} -- "
+                        f"restoring in {seq + _EAS_POST_RESUME_GRACE:.0f}s"
+                    )
+                mappings[cid] = mapping
+                changed = True
             continue
+        restore_at = mapping.get("eas_restore_at")
         if restore_at and now_ts >= float(restore_at):
             try:
-                _eas_do_restore(cid, mapping, mappings)
+                if mapping.get("eas_returned"):
+                    _eas_finish_seamless(cid, mapping, mappings, rc)
+                else:
+                    _eas_do_restore(cid, mapping, mappings, rc)
                 changed = True
             except Exception as e:
                 logger.error(f"[EmergencyAlertarr] EAS: timed restore failed ch {cid}: {e}", exc_info=True)
     return changed
 
 def _eas_restore_tick():
-    """Fast, network-free restore check run every few seconds between full alert
-    polls, so overlay timing is accurate (anchored to stream resumption and
-    restored promptly) even when the poll interval is long."""
+    """Fast, network-free restore check run every couple of seconds between full
+    alert polls, so overlay timing is accurate even when the poll interval is
+    long."""
     try:
+        _eas_tick_count["n"] += 1
+        watchdog_due = _eas_tick_count["n"] % _EAS_WATCHDOG_EVERY == 0
         mappings = _get_mappings()
-        if not mappings or not any(
-            m.get("eas_await_stream") or m.get("eas_restore_at")
+        busy = mappings and any(
+            isinstance(m, dict) and (m.get("eas_await_stream") or m.get("eas_restore_at")
+                                     or m.get("eas_passthrough_id"))
             for m in mappings.values()
-        ):
+        )
+        rc0 = _get_redis_client()
+        if _eas_json_get(rc0, _EAS_JOIN_KEY, None):
+            with _EasMutex(rc0) as held:
+                if held:
+                    mp = _get_mappings()
+                    if _eas_join_window_locked(rc0, _get_settings(), mp, _eas_streaming_ids(rc0)):
+                        _save_mappings(mp)
+        if not busy:
+            if watchdog_due and mappings:
+                rc = _get_redis_client()
+                with _EasMutex(rc) as held:
+                    if held:
+                        _eas_watchdog_locked(rc)
             return
         rc = _get_redis_client()
-        # Light lock so only one worker runs the tick per window (avoids N workers
-        # racing on restores every few seconds).
-        if rc and not rc.set("emergencyalertarr:eas_tick_lock", "1", nx=True, ex=_EAS_TICK_SECS):
-            return
-        if _eas_process_restores(mappings, _eas_streaming_ids(rc), time.time()):
-            _save_mappings(mappings)
+        with _EasMutex(rc) as held:
+            if not held:
+                return   # another worker is mid-sweep/tick; it will handle it
+            mappings = _get_mappings()   # fresh copy now that we hold the lock
+            streaming = _eas_streaming_ids(rc)
+            ch = _eas_process_restores(mappings, streaming, time.time(), rc)
+            if _eas_tick_count["n"] % 5 == 0 and any(
+                    isinstance(m, dict) and m.get("eas_national") for m in mappings.values()):
+                if _eas_national_join_locked(rc, _get_settings(), mappings, streaming):
+                    ch = True
+            if ch:
+                _save_mappings(mappings)
+            if watchdog_due:
+                _eas_watchdog_locked(rc)
     except Exception as e:
         logger.error(f"[EmergencyAlertarr] EAS restore tick error: {e}", exc_info=True)
 
@@ -1764,349 +1847,1624 @@ def _eas_arm_restore(mapping, seq_duration, now):
     mapping["eas_await_stream"] = True
     mapping["eas_seen_down"] = False
     mapping["eas_restore_at"] = float(now) + _EAS_MAX_RECONNECT_WAIT + float(seq_duration)
+    mapping["eas_fired_at"] = float(now)
+    mapping["eas_hard_deadline"] = (float(now) + _EAS_MAX_RECONNECT_WAIT + float(seq_duration)
+                                    + _EAS_HARD_DEADLINE_EXTRA)
+
+def _eas_fire_cfg(settings):
+    """Overlay/audio settings shared by real alerts, tests and injections."""
+    def _num(key, default, lo, hi, cast=float):
+        try:
+            return max(lo, min(hi, cast(settings.get(key) or default)))
+        except Exception:
+            return default
+    ep_font, ep_scale = _easyplus_settings(settings)
+    return {
+        "silence_secs":   _num("eas_silence_secs", 15, 10, 20, int),
+        "transcode_mode": settings.get("eas_transcode_mode") or "full",
+        "style":          (settings.get("eas_overlay_style") or "dasdec").lower(),
+        "use_tts":        bool(settings.get("eas_tts_enabled", True)),
+        "generate_tones": bool(settings.get("eas_generate_tones", True)),
+        "att_secs":       _num("eas_att_secs", 8.0, 4.0, 30.0),
+        "tail_secs":      _num("eas_endec_tail_secs", 7.5, 1.0, 30.0),
+        "ep_font":        ep_font,
+        "ep_scale":       ep_scale,
+        "style_opts":     _eas_style_opts(settings),
+        "tts_opts":       _eas_tts_opts(settings),
+        "endec":          None,          # always the encoder that matches the screen style
+        # FCC 47 CFR 11.61(a)(2): a Required Weekly Test is header + EOM only.
+        "rwt_short":      bool(settings.get("eas_endec_test_mode", True)),
+        "audio_opts": {
+            "render":      True,
+            "loudness":    str(settings.get("eas_loudness") or "-24"),
+            "tone_offset": _num("eas_tone_offset_lu", 8.0, 0.0, 20.0),
+            "channels":    (settings.get("eas_audio_channels") or "both").lower(),
+            "hum":         {"60": 60, "50": 50}.get(str(settings.get("eas_audio_hum") or "off")),
+            "click":       bool(settings.get("eas_audio_click", True)),
+            "program":     (settings.get("eas_program_audio") or "switch").lower(),
+            "duck_db":     _num("eas_duck_db", 18.0, 6.0, 40.0),
+            "cap_audio":   bool(settings.get("eas_use_cap_audio", True)),
+            "retune_freeze": _EAS_RETUNE_FREEZE,
+            # SARA set-top boxes play the alert a little hotter than the channel.
+            "boost_db":    4.0 if (settings.get("eas_overlay_style") or "").lower().startswith("sara") else 0.0,
+        },
+        "video_opts": {
+            "sd_look": {"legacy": "legacy", "all": "all"}.get(
+                (settings.get("eas_sd_look") or "legacy").lower()),
+        },
+        "relay_own_id":   bool(settings.get("eas_relay_own_id", True)),
+        "cable_mode":     _eas_transition_for(settings)[0],
+        "details_channel": _eas_chan(settings, "eas_details_channel"),
+        "details_secs":   2.0,
+        "retune_freeze":  _EAS_RETUNE_FREEZE,
+        "retune_black":   _EAS_RETUNE_BLACK,
+        "retune_blocky":  _eas_transition_for(settings)[1],
+        "dispatcharr_url": (settings.get("eas_dispatcharr_url") or "").strip(),
+        "transcode_mode_out": settings.get("eas_transcode_mode") or "full",
+    }
+
+# Channel switch timing (fixed, like a set-top box retuning).
+_EAS_RETUNE_FREEZE = 1.0
+_EAS_RETUNE_BLACK = 1.5
+
+def _eas_chan(settings, key):
+    """Channel id from a channel-picker setting ('' when none). Dispatcharr
+    rejects select options with an empty value, so 'none' is the sentinel."""
+    v = str(settings.get(key) or "").strip()
+    return "" if v.lower() in ("", "none", "off", "0") else v
+
+def _eas_transition_for(settings):
+    """(cable mode, blocky). Every full-screen style switches like a set-top
+    box retuning: the channel's picture freezes for a second, goes black, then
+    the alert comes up (and the same on the way back). With a details channel
+    picked, the box tunes there first. Styles drawn over the program (SARA,
+    tickers) just appear."""
+    style = (settings.get("eas_overlay_style") or "dasdec").lower()
+    if style in _EAS_LIVE_STYLE_KEYS:
+        return "sa", False
+    if _eas_chan(settings, "eas_details_channel"):
+        return "motorola", False
+    return "retune", False
+
+def _eas_style_opts(settings):
+    """Screen-style options from the plugin settings (see eaa_styles)."""
+    def _num(key, default, lo, hi, cast=float):
+        try:
+            return max(lo, min(hi, cast(settings.get(key) or default)))
+        except Exception:
+            return default
+    heading = settings.get("eas_dasdec_heading")
+    heading = None if heading in (None, "") else str(heading).strip()
+    if heading is not None and heading.lower() == "none":
+        heading = ""
+    return {
+        "heading":       heading,
+        "heading_mode":  "custom" if heading is not None else "auto",
+        "spanish":       bool(settings.get("eas_spanish", False)),
+        "aspect":        (settings.get("eas_aspect") or "pillarbox").lower(),
+        "page_secs":     _num("eas_page_secs", 7.0, 3.0, 30.0),
+        "crawl_speed":   _num("eas_crawl_speed", 5, 1, 10, int),
+        "crawl_px":      30.0 * _num("eas_crawl_speed", 5, 1, 10, int) + 30.0,
+        "tune_to":       (settings.get("eas_tune_to") or "").strip(),
+        "station_id":    _eas_station_id_setting(settings),
+        "fcc2023":       bool(settings.get("eas_fcc2023_wording", True)),
+        "show_cap_text": bool(settings.get("eas_show_cap_text", True)),
+        "bg":            (settings.get("eas_bg_color") or "").strip().lower(),
+        "legacy_names":  bool(settings.get("eas_legacy_originator", False)),
+        "operator_name": (settings.get("eas_operator_name") or "").strip(),
+        "sara_secs":     _num("eas_sara_secs", 3.0, 1.0, 15.0),
+    }
+
+def _eas_tts_opts(settings):
+    """Readout voice settings (see eaa_tts)."""
+    try:
+        speed = max(0.6, min(1.6, float(settings.get("eas_tts_speed") or 1.0)))
+    except Exception:
+        speed = 1.0
+    return {
+        "engine":      (settings.get("eas_tts_engine") or "auto").lower(),
+        "voice":       (settings.get("eas_tts_voice") or "kal16").lower(),
+        "fx":          (settings.get("eas_tts_fx") or "endec").lower(),
+        "speed":       speed,
+        "custom_cmd":  (settings.get("eas_tts_custom_cmd") or "").strip(),
+        "piper_model": (settings.get("eas_tts_piper_model") or "").strip(),
+    }
+
+def _eas_station_id_setting(settings):
+    """8-character LLLLLLLL station ID for alerts this plugin originates."""
+    raw = (settings.get("eas_station_id") or "EAA/IPTV").strip().upper()
+    raw = "".join(ch for ch in raw if ch.isalnum() or ch in "/-")[:8]
+    return raw or "EAA/IPTV"
+
+_eas_preroll_cache = {}
+
+_eas_clone_info = {}
+
+_eas_armed_mem = {}
+
+# Temporary "remux" profile used to hand a session back to a channel whose
+# normal profile is Dispatcharr's built-in Proxy (which can't take over a
+# running FFmpeg session). It is swapped back for the real profile as soon
+# as nobody is watching the channel any more.
+_EAS_PASSTHRU_PREFIX = "EmergencyAlertarr passthrough "
+
+def _eas_session_on_alert(rc, cid, mapping):
+    """True when Dispatcharr's live session for this channel was started with
+    our alert profile (metadata stream_profile == the clone's id)."""
+    pid = mapping.get("eas_profile_id")
+    if not (rc and pid):
+        return False
+    try:
+        from apps.channels.models import Channel as _Ch
+        ch = _Ch.objects.filter(id=int(cid)).first()
+        if not ch:
+            return False
+        return _eas_channel_meta_profile(rc, str(ch.uuid)) == str(pid)
+    except Exception:
+        return False
+
+def _eas_proc_pid(tag):
+    """PID of the FFmpeg carrying this alert tag in this container, 0 if none,
+    None if /proc can't be read."""
+    if not tag:
+        return None
+    needle = f"EAA-{tag}".encode()
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    if needle in f.read():
+                        return int(pid)
+            except Exception:
+                continue
+        return 0
+    except Exception:
+        return None
+
+def _eas_meta_session(rc, channel_uuid):
+    """(stream_profile_id, init_time) of the channel's live session, or
+    (None, None)."""
+    if not rc:
+        return None, None
+    try:
+        from apps.proxy.live_proxy.redis_keys import RedisKeys
+        key = RedisKeys.channel_metadata(channel_uuid)
+    except Exception:
+        key = f"live:channel:{channel_uuid}:metadata"
+    try:
+        vals = rc.hmget(key, ["stream_profile", "init_time"])
+        out = []
+        for v in vals:
+            out.append((v.decode() if isinstance(v, bytes) else str(v)).strip() if v is not None else None)
+        return out[0] or None, out[1] or None
+    except Exception:
+        return None, None
+
+def _eas_proc_running(tag):
+    """True if an FFmpeg with this alert tag is still running in this
+    container (None if that can't be checked)."""
+    if not tag:
+        return None
+    needle = f"EAA-{tag}".encode()
+    try:
+        found = False
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    if needle in f.read():
+                        found = True
+                        break
+            except Exception:
+                continue
+        return found
+    except Exception:
+        return None
+
+def _eas_return_profile(channel, mapping):
+    """The profile the session should continue on after the alert: the
+    channel's own profile when it is an FFmpeg/Streamlink/VLC command, else a
+    temporary FFmpeg remux of the same stream (for Proxy / Redirect / system
+    default). Returns (profile_or_None, passthrough_created)."""
+    from core.models import StreamProfile
+    orig = None
+    if mapping.get("original_profile_id"):
+        orig = StreamProfile.objects.filter(id=mapping["original_profile_id"]).first()
+    if orig is None:
+        try:
+            from core.models import CoreSettings
+            dp = CoreSettings.get_default_stream_profile_id()
+            orig = StreamProfile.objects.filter(id=dp).first() if dp else None
+        except Exception:
+            orig = None
+    usable = (orig is not None and not orig.is_proxy() and not getattr(orig, "is_redirect", lambda: False)()
+              and (orig.command or "").strip() and (orig.parameters or "").strip())
+    if usable:
+        # The channel's own profile (or, for "system default", None = default).
+        return (orig if mapping.get("original_profile_id") else None), False
+    pt = StreamProfile(
+        name=f"{_EAS_PASSTHRU_PREFIX}[ch{mapping.get('_cid', '')}]",
+        command="ffmpeg",
+        parameters="-hide_banner -nostdin -user_agent {userAgent} -i {streamUrl} -map 0:v? -map 0:a? "
+                   "-c copy -f mpegts pipe:1",
+        locked=False, is_active=True,
+    )
+    pt.save()
+    return pt, True
+
+_EAS_ARMED_PREFIX = f"emergencyalertarr:{_PLUGIN_KEY}:eas_armed:"
+
+def _eas_return_command(original_profile_id):
+    """(command, parameters) the session should run after the alert: the
+    channel's own FFmpeg/Streamlink/VLC profile (or the system default when
+    that is one), else a copy-only FFmpeg remux of the same stream (Proxy /
+    Redirect can't take over a running FFmpeg session)."""
+    from core.models import StreamProfile
+    orig = None
+    if original_profile_id:
+        orig = StreamProfile.objects.filter(id=original_profile_id).first()
+    if orig is None:
+        try:
+            from core.models import CoreSettings
+            dp = CoreSettings.get_default_stream_profile_id()
+            orig = StreamProfile.objects.filter(id=dp).first() if dp else None
+        except Exception:
+            orig = None
+    if (orig is not None and not orig.is_proxy() and not getattr(orig, "is_redirect", lambda: False)()
+            and (orig.command or "").strip() and (orig.parameters or "").strip()):
+        return orig.command, orig.parameters
+    return ("ffmpeg", "-hide_banner -nostdin -user_agent {userAgent} -i {streamUrl} -map 0:v? -map 0:a? "
+                      "-c copy -f mpegts pipe:1")
+
+def _eas_neutralize_clone(clone_id, original_profile_id):
+    """Turn the alert profile into the channel's normal stream command once
+    the alert FFmpeg is running. Whatever makes Dispatcharr reconnect the
+    session next -- the alert ending itself (-t), a health reconnect, a
+    failover retry -- then continues on the normal stream instead of playing
+    the alert a second time."""
+    from core.models import StreamProfile
+    prof = StreamProfile.objects.filter(id=clone_id).first()
+    if prof is None:
+        return False
+    cmd, params = _eas_return_command(original_profile_id)
+    prof.command = cmd
+    prof.parameters = params
+    prof.save()
+    return True
+
+def _eas_neutralize_at(started, stream_end):
+    """When to turn the alert profile back into the normal command: late
+    enough that a session hiccup in the first seconds of the alert simply
+    restarts the ALERT (instead of dropping the viewer back on the normal
+    channel -- the "stream pauses and comes back normal" failure), early
+    enough to be done before the alert FFmpeg ends itself (-t, which comes a
+    few seconds early because of the initial read burst)."""
+    se = float(stream_end or 0)
+    return float(started) + max(se * 0.5, se - 12.0)
+
+def _eas_start_arm_watcher(channel, mapping):
+    """Follow the alert session on this channel (independently of the restore
+    tick, which can be held up by the mutex):
+
+      * the moment the alert FFmpeg is seen running, mark the alert as
+        confirmed (Redis eas_armed:<cid>, neutralized=False);
+      * if the session restarts before the alert is over (Dispatcharr
+        teardown race, provider hiccup, player reconnect), start counting
+        from the new session -- the alert plays again from the top;
+      * shortly before the alert ends, neutralize the alert profile so the
+        session continues on the normal stream instead of replaying it, and
+        mark neutralized=True (the tick then schedules the tidy-up)."""
+    clone_id = mapping.get("eas_profile_id")
+    tag = mapping.get("eas_tag")
+    orig_id = mapping.get("original_profile_id")
+    stream_end = float(mapping.get("eas_stream_end") or 0)
+    cid = str(channel.id)
+    uuid = str(channel.uuid)
+    if not (clone_id and tag and stream_end):
+        return
+
+    def _mark(rc, started, neutralized):
+        data = {"tag": tag, "ts": started, "neutralized": bool(neutralized)}
+        if rc is not None:
+            try:
+                rc.setex(f"{_EAS_ARMED_PREFIX}{cid}", 900, json.dumps(data))
+                return
+            except Exception:
+                pass
+        _eas_armed_mem[cid] = data
+
+    def _run():
+        rc = _get_redis_client()
+        t0 = time.time()
+        started = None          # when the current alert session began
+        sig = None              # identity of that session (pid / init_time)
+        last_proc = 0.0
+        pid = None
+        meta_since = None
+        try:
+            while True:
+                now = time.time()
+                if started is None and now - t0 > 120:
+                    logger.warning(f"[EmergencyAlertarr] EAS: couldn't confirm the alert started on ch {cid}")
+                    return
+                if now - t0 > 900:
+                    return
+                if now - last_proc >= 2.0:
+                    # Is the alert profile still ours? (restored / stopped -> done)
+                    try:
+                        from core.models import StreamProfile
+                        if not StreamProfile.objects.filter(id=clone_id).exists():
+                            return
+                    except Exception:
+                        pass
+                    pid = _eas_proc_pid(tag)
+                    last_proc = now
+                meta_prof, init_time = _eas_meta_session(rc, uuid)
+                on_meta = meta_prof == str(clone_id)
+                new_sig = None
+                if pid:
+                    new_sig = f"pid:{pid}"
+                elif on_meta:
+                    if pid is None:
+                        # No /proc view (FFmpeg in another container): trust the
+                        # session metadata once it has said so for a moment.
+                        meta_since = meta_since or now
+                        if now - meta_since >= 3.0:
+                            new_sig = f"init:{init_time}"
+                    else:
+                        meta_since = None
+                else:
+                    meta_since = None
+                if new_sig and new_sig != sig:
+                    if started is not None:
+                        logger.info(f"[EmergencyAlertarr] EAS: alert session restarted on ch {cid} -- "
+                                    f"playing it from the top")
+                    sig = new_sig
+                    started = now - (3.0 if new_sig.startswith("init:") else 1.0)
+                    _mark(rc, started, False)
+                    logger.info(f"[EmergencyAlertarr] EAS: alert playing on ch {cid}")
+                if started is not None and now >= _eas_neutralize_at(started, stream_end):
+                    if _eas_neutralize_clone(clone_id, orig_id):
+                        _mark(rc, started, True)
+                        logger.info(f"[EmergencyAlertarr] EAS: alert ending on ch {cid} -- "
+                                    f"return to the channel armed")
+                    return
+                time.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"[EmergencyAlertarr] EAS: arm watcher ch {cid}: {e}")
+        finally:
+            try:
+                from django.db import connection
+                connection.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+def _eas_armed_get(rc, cid):
+    if rc is not None:
+        try:
+            v = rc.get(f"{_EAS_ARMED_PREFIX}{cid}")
+            return json.loads(v.decode() if isinstance(v, bytes) else v) if v else None
+        except Exception:
+            pass
+    return _eas_armed_mem.get(cid)
+
+def _eas_armed_clear(rc, cid):
+    _eas_armed_mem.pop(cid, None)
+    if rc is not None:
+        try:
+            rc.delete(f"{_EAS_ARMED_PREFIX}{cid}")
+        except Exception:
+            pass
+
+def _eas_finish_seamless(cid, mapping, mappings, rc=None):
+    """After the alert stream ended by itself: tidy up WITHOUT stopping the
+    channel (the session already continues on the return profile). Falls back
+    to the stop/restart restore if the alert FFmpeg is somehow still running."""
+    running = _eas_proc_running(mapping.get("eas_tag"))
+    _eas_armed_clear(rc, cid)
+    if running:
+        logger.warning(f"[EmergencyAlertarr] EAS: alert stream on ch {cid} didn't end -- restarting it")
+        return _eas_do_restore(cid, mapping, mappings, rc)
+    eas_pid = mapping.get("eas_profile_id")
+    # The session now runs the (neutralized) alert profile's normal command.
+    # Put the channel's real profile back in the DB -- or, for Proxy, a remux
+    # profile until nobody is watching (see _eas_passthrough_cleanup).
+    try:
+        from apps.channels.models import Channel as _Ch
+        ch0 = _Ch.objects.filter(id=int(cid)).first()
+        if ch0 is not None:
+            mapping["_cid"] = cid
+            prof, created = _eas_return_profile(ch0, mapping)
+            mapping.pop("_cid", None)
+            _assign_profile(ch0, prof, slot=mapping.get("eas_slot"))
+            if created:
+                mapping["eas_passthrough_id"] = prof.id
+            if prof is not None:
+                mapping["eas_return_profile_id"] = prof.id
+            else:
+                try:
+                    from core.models import CoreSettings
+                    mapping["eas_return_profile_id"] = CoreSettings.get_default_stream_profile_id()
+                except Exception:
+                    mapping["eas_return_profile_id"] = None
+    except Exception as e:
+        logger.warning(f"[EmergencyAlertarr] EAS: return profile ch {cid}: {e}")
+    try:
+        from apps.channels.models import Channel as _Ch
+        ch = _Ch.objects.filter(id=int(cid)).first()
+        if ch is not None and rc is not None and mapping.get("eas_return_profile_id"):
+            try:
+                from apps.proxy.live_proxy.redis_keys import RedisKeys
+                key = RedisKeys.channel_metadata(str(ch.uuid))
+            except Exception:
+                key = f"live:channel:{ch.uuid}:metadata"
+            try:
+                if rc.exists(key):
+                    rc.hset(key, "stream_profile", str(mapping["eas_return_profile_id"]))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if eas_pid:
+        _eas_clone_remember(rc, eas_pid)
+        _delete_cloned_profile(eas_pid)
+    for k in ("eas_profile_id", "ticker_profile_id", "eas_restore_at", "eas_await_stream",
+              "eas_seen_down", "eas_seq_secs", "eas_hard_deadline", "eas_fired_at",
+              "eas_national", "eas_priority", "eas_returned", "eas_tag", "eas_stream_end",
+              "eas_return_profile_id"):
+        mapping.pop(k, None)
+    mappings[cid] = mapping
+    for fn in (lambda: _eas_clear(cid), lambda: _eas_pop_stopped(rc, cid),
+               lambda: _eas_state_set(rc, cid, None)):
+        try:
+            fn()
+        except Exception:
+            pass
+    with _eas_lock:
+        _eas_active.pop(cid, None)
+    _eas_mark_alert_end(rc)
+    logger.info(f"[EmergencyAlertarr] EAS: sequence complete on ch {cid} -- back on the normal stream "
+                f"(no reconnect needed)")
+
+def _eas_passthrough_cleanup(cid, mapping, mappings, streaming_ids):
+    """Put the channel's real profile back once nobody is watching (the
+    temporary remux profile only existed to carry the running session)."""
+    if not mapping.get("eas_passthrough_id") or mapping.get("eas_profile_id"):
+        return False
+    if cid in streaming_ids:
+        return False
+    try:
+        from apps.channels.models import Channel as _Ch
+        ch = _Ch.objects.filter(id=int(cid)).first()
+        if ch is not None:
+            _restore_profile(ch, mapping.get("original_profile_id"), slot=mapping.get("eas_slot"))
+    except Exception as e:
+        logger.warning(f"[EmergencyAlertarr] EAS: passthrough cleanup ch {cid}: {e}")
+        return False
+    _eas_delete_passthrough(mapping.pop("eas_passthrough_id", None))
+    mapping.pop("eas_slot", None)
+    mappings[cid] = mapping
+    logger.info(f"[EmergencyAlertarr] EAS: ch {cid} idle -- normal stream profile put back")
+    return True
+
+def _eas_delete_passthrough(pid):
+    if not pid:
+        return
+    try:
+        from core.models import StreamProfile
+        StreamProfile.objects.filter(id=pid, name__startswith=_EAS_PASSTHRU_PREFIX).delete()
+    except Exception:
+        pass
+
+_eas_seq_cache = {}
+
+def _eas_channel_has_audio(channel):
+    """False when Dispatcharr's stream stats say the channel's stream has video
+    but no audio (an over-the-program alert must not reference [0:a] then);
+    True/None otherwise."""
+    try:
+        seen_video = False
+        for st in channel.streams.all()[:5]:
+            stats = getattr(st, "stream_stats", None) or {}
+            if isinstance(stats, str):
+                stats = json.loads(stats or "{}")
+            if stats.get("audio_codec"):
+                return True
+            if stats.get("video_codec"):
+                seen_video = True
+        return False if seen_video else None
+    except Exception:
+        return None
+
+def _eas_cleanup_seq_files(keep_secs=3 * 3600):
+    now = time.time()
+    try:
+        for f in os.listdir(RUNTIME_DIR):
+            if f.startswith(("seq_", "capaudio_", "capsrc_")) and now - os.path.getmtime(
+                    os.path.join(RUNTIME_DIR, f)) > keep_secs:
+                os.remove(os.path.join(RUNTIME_DIR, f))
+    except Exception:
+        pass
+
+def _eas_details_channel(cfg):
+    """The force-tune details channel (Channel object) or None."""
+    if cfg.get("cable_mode") != "motorola" or not cfg.get("details_channel"):
+        return None
+    try:
+        from apps.channels.models import Channel
+        return Channel.objects.filter(id=int(cfg["details_channel"])).first()
+    except Exception:
+        return None
+
+def _eas_alert_still(cfg, alert, out_w, out_h):
+    """First frame of the alert screen (PNG, cached per alert + style) -- what
+    the blocky retune breaks up into."""
+    from eaa_forcetune import render_still, preroll_key
+    style = cfg["style"]
+    sd = cfg["video_opts"].get("sd_look") and (
+        cfg["video_opts"]["sd_look"] == "all" or style in _EAS_LEGACY_STYLES)
+    key = preroll_key("still", alert.get("id") or _eas_same_header_string(alert), style,
+                      out_w, out_h, bool(sd))
+    path = os.path.join(RUNTIME_DIR, f"preroll_still_{key}.png")
+    if os.path.isfile(path):
+        return path
+    sopts = dict(cfg["style_opts"])
+    sopts.setdefault("scale", cfg["ep_scale"])
+    if cfg["ep_font"]:
+        sopts.setdefault("font_override", cfg["ep_font"])
+    ov = build_style_overlay("ft", alert, style, out_w, out_h, sopts)
+    if ov.get("live"):
+        ok = render_still(None, f"scale={out_w}:{out_h},setsar=1", path)
+    else:
+        cw, ch, _bg = ov["canvas"]
+        sdc = ("," + _eas_sd_chain(cw, ch)) if sd else ""
+        ok = render_still(ov["canvas"], f"format=yuv420p,{ov['filter']}{sdc},{ov['finish']}", path)
+    _eas_clear("ft")
+    return path if ok else None
+
+def _eas_retune_frame_path(cid):
+    return os.path.join(RUNTIME_DIR, f"retune_frame_{cid}.png")
+
+def _eas_capture_retune_frames(cfg, channels):
+    """Grab the current picture of every channel about to switch, in parallel
+    (each is the frame that 'freezes' when the box retunes)."""
+    if cfg.get("cable_mode") != "retune" or not channels:
+        return
+    from eaa_forcetune import capture_channel_frame
+    _ensure_dirs()
+    threads = []
+    for ch in channels:
+        path = _eas_retune_frame_path(ch.id)
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except Exception:
+            pass
+        t = threading.Thread(target=capture_channel_frame,
+                             args=(str(ch.uuid), path, cfg.get("dispatcharr_url") or ""), daemon=True)
+        t.start()
+        threads.append(t)
+    deadline = time.time() + 9
+    for t in threads:
+        t.join(timeout=max(0.1, deadline - time.time()))
+    _eas_mutex_touch()
+
+def _eas_prepare_retune(cfg, alert, channel):
+    """Set-top retune lead-in for one channel: its own picture frozen for a
+    second, black, then the alert. Clean (no blocks) unless asked for."""
+    if channel is None or cfg.get("cable_mode") != "retune":
+        return None
+    try:
+        from eaa_forcetune import build_retune, cleanup_prerolls
+        _ensure_dirs()
+        cleanup_prerolls(RUNTIME_DIR)
+        out_w, out_h = _EAS_CANVAS.get(cfg.get("transcode_mode_out") or "full", (1920, 1080))
+        frame = _eas_retune_frame_path(channel.id)
+        if not (os.path.isfile(frame) and time.time() - os.path.getmtime(frame) < 120):
+            frame = None
+        out = os.path.join(RUNTIME_DIR, f"preroll_retune_{channel.id}_{int(time.time())}.mp4")
+        if cfg.get("retune_blocky"):
+            still = _eas_alert_still(cfg, alert, out_w, out_h)
+            res = None
+            if still:
+                from eaa_forcetune import build_preroll
+                res = build_preroll(frame, still, out, out_w, out_h,
+                                    details_secs=max(0.5, cfg["retune_freeze"]), blocky=True)
+        else:
+            res = build_retune(frame, out, out_w, out_h, cfg["retune_freeze"], cfg["retune_black"])
+        if res:
+            res["end"] = "blocky" if cfg.get("retune_blocky") else "clean"
+            logger.info(f"[EmergencyAlertarr] retune: lead-in for ch {channel.id} "
+                        f"({'freeze + ' if frame else ''}black, {res['secs']:.1f}s)")
+        return res
+    except Exception as e:
+        logger.warning(f"[EmergencyAlertarr] retune: lead-in unavailable ({e})")
+        return None
+
+def _eas_prepare_preroll(cfg, alert, channel=None):
+    """Lead-in before the alert: "retune" mode = the viewer's channel freezes,
+    goes black, then the alert; "motorola" mode = a few seconds of the details
+    channel first (built once, shared by every channel). None in instant
+    (Scientific-Atlanta style) mode, and for styles drawn over the program."""
+    if cfg.get("style") in _EAS_LIVE_STYLE_KEYS:
+        return None
+    if cfg.get("cable_mode") == "retune":
+        return _eas_prepare_retune(cfg, alert, channel)
+    det = _eas_details_channel(cfg)
+    if det is None:
+        return None
+    try:
+        from eaa_forcetune import (capture_details_clip, render_still, build_preroll,
+                                   cleanup_prerolls, preroll_key)
+        _ensure_dirs()
+        style = cfg["style"]
+        out_w, out_h = _EAS_CANVAS.get(cfg.get("transcode_mode_out") or "full", (1920, 1080))
+        sd = cfg["video_opts"].get("sd_look") and (
+            cfg["video_opts"]["sd_look"] == "all" or style in _EAS_LEGACY_STYLES)
+        key = preroll_key(alert.get("id") or _eas_same_header_string(alert), style, det.id,
+                          out_w, out_h, bool(sd), cfg["details_secs"], cfg["retune_blocky"],
+                          cfg["retune_freeze"], cfg["retune_black"])
+        hit = _eas_preroll_cache.get(key)
+        if hit and os.path.isfile(hit["path"]):
+            return hit
+        cleanup_prerolls(RUNTIME_DIR)
+        clip = os.path.join(RUNTIME_DIR, f"details_clip_{det.id}.mp4")
+        fresh = os.path.isfile(clip) and time.time() - os.path.getmtime(clip) < 600
+        if not fresh:
+            _eas_mutex_touch()
+            capture_details_clip(str(det.uuid), clip, secs=cfg["details_secs"] + 2.0,
+                                 base_setting=cfg.get("dispatcharr_url") or "")
+            _eas_mutex_touch()
+        if not os.path.isfile(clip):
+            clip = None
+        still = _eas_alert_still(cfg, alert, out_w, out_h) if cfg["retune_blocky"] else None
+        if cfg["retune_blocky"] and not still:
+            return None
+        _eas_mutex_touch()
+        res = build_preroll(clip, still, os.path.join(RUNTIME_DIR, f"preroll_{key}.mp4"),
+                            out_w, out_h, details_secs=cfg["details_secs"],
+                            blocky=cfg["retune_blocky"], freeze_secs=cfg["retune_freeze"],
+                            black_secs=cfg["retune_black"])
+        _eas_mutex_touch()
+        if res:
+            res["end"] = "blocky" if cfg["retune_blocky"] else "clean"
+            _eas_preroll_cache.clear()
+            _eas_preroll_cache[key] = res
+            logger.info(f"[EmergencyAlertarr] force-tune: lead-in ready via '{det.name}' ({res['secs']:.1f}s)")
+        return res
+    except Exception as e:
+        logger.warning(f"[EmergencyAlertarr] force-tune: lead-in unavailable ({e}) -- alert plays without it")
+        return None
+
+def _eas_activate(channel, mapping, alerts, settings, endec_test=False, now_ts=None,
+                  eom_only=False):
+    """Switch one channel onto a freshly built alert profile and arm its timed
+    restore. Updates `mapping` in place and returns the sequence duration. The
+    caller saves mappings and kicks the stream restart.
+
+    The profile the channel is really playing right now (override-aware, or
+    the system default) is snapshotted as the restore target, so the restore
+    always puts back exactly what was there."""
+    from core.models import StreamProfile
+    cfg = _eas_fire_cfg(settings)
+    if cfg["rwt_short"] and alerts and eas_event_code(alerts[0]) == "RWT":
+        endec_test = True     # RWT = header + EOM only (FCC 11.61)
+    for a in alerts or []:
+        if not a.get("station_id") and _eas_org_code(a) in ("EAS", "CIV"):
+            a["station_id"] = cfg["style_opts"]["station_id"]
+        if cfg["relay_own_id"] and a.get("source") in ("NWS", "IPAWS", "monitor"):
+            # Relaying: the outgoing header carries OUR station ID; the
+            # originator's issue time and valid period are kept.
+            a["relay_station_id"] = cfg["style_opts"]["station_id"]
+    national = bool(alerts) and _eas_classify(alerts[0]) == "national" and not eom_only
+    slot, holder = _eas_profile_slot(channel)
+    cur = getattr(holder, "stream_profile", None)
+    if cur is not None and not (cur.name or "").startswith((PROFILE_PREFIX, _EAS_PASSTHRU_PREFIX)):
+        mapping["original_profile_id"] = cur.id
+    elif cur is None and slot == "channel":
+        mapping["original_profile_id"] = None          # system default profile
+    # (cur is a leftover EAS clone -> keep the stored original)
+
+    for k in ("eas_profile_id", "ticker_profile_id"):
+        if mapping.get(k):
+            _delete_cloned_profile(mapping[k])
+            mapping.pop(k, None)
+
+    orig = None
+    if mapping.get("original_profile_id"):
+        orig = StreamProfile.objects.filter(id=mapping.get("original_profile_id")).first()
+
+    cfg["audio_opts"] = dict(cfg["audio_opts"], has_audio=_eas_channel_has_audio(channel))
+    eas_profile, _, seq_duration = _clone_and_inject_eas(
+        channel.id, orig, channel.name, cfg["silence_secs"], cfg["transcode_mode"],
+        style=cfg["style"], unique_alerts=alerts, use_tts=cfg["use_tts"],
+        endec_test=endec_test, tail_secs=cfg["tail_secs"],
+        style_opts=cfg["style_opts"], tts_opts=cfg["tts_opts"],
+        endec=cfg["endec"],
+        audio_opts=cfg["audio_opts"], video_opts=cfg["video_opts"],
+        preroll=(None if eom_only else _eas_prepare_preroll(cfg, alerts[0] if alerts else {}, channel)),
+        eom_only=eom_only, national_hold=national,
+        generate_tones=cfg["generate_tones"], att_secs=cfg["att_secs"],
+        easyplus_font=cfg["ep_font"], easyplus_scale=cfg["ep_scale"],
+    )
+    try:
+        slot = _assign_profile(channel, eas_profile, slot=slot)
+    except Exception:
+        _delete_cloned_profile(eas_profile.id)
+        raise
+    mapping["eas_profile_id"] = eas_profile.id
+    mapping["eas_slot"] = slot
+    info = _eas_clone_info.pop(str(channel.id), {}) or {}
+    mapping["eas_tag"] = info.get("tag")
+    mapping["eas_stream_end"] = info.get("end")
+    for k in ("eas_returned", "eas_return_profile_id"):
+        mapping.pop(k, None)
+    if mapping.get("eas_passthrough_id"):
+        _eas_delete_passthrough(mapping.pop("eas_passthrough_id"))
+    _eas_clone_remember(_get_redis_client(), eas_profile.id)
+    now_ts = now_ts or time.time()
+    _eas_arm_restore(mapping, seq_duration, now_ts)
+    mapping["eas_priority"] = int((alerts[0] if alerts else {}).get("_priority") or
+                                  decide(alerts[0] if alerts else {}, settings)["priority"])
+    if not national and mapping.get("eas_tag"):
+        _eas_armed_clear(_get_redis_client(), str(channel.id))
+        _eas_start_arm_watcher(channel, mapping)
+    if national:
+        # No timeout and no automatic reset for a national alert: it holds the
+        # channel until it's over (then the sweep sends the EOM).
+        hold = max(seq_duration, _eas_national_hold_secs(alerts[0], now_ts))
+        mapping["eas_national"] = True
+        # The sweep ends it (EOM) when it leaves the feed or expires; these
+        # are only the fallbacks if the sweep can't run.
+        mapping["eas_restore_at"] = now_ts + hold + 300
+        mapping["eas_hard_deadline"] = now_ts + hold + 420
+    else:
+        mapping.pop("eas_national", None)
+    return seq_duration
+
+def _eas_kick(channel, rc=None):
+    """Restart the channel's stream so the viewer reconnects onto the alert."""
+    _eas_pop_stopped(rc, str(channel.id))   # clear any stale marker first
+    _restart_channel_stream_async(channel, label="EAS", proactive=True)
+
+def _eas_get_alerts(rc, settings, zones, severity_threshold, interval):
+    """Current alert list, shared across workers through a short Redis cache so
+    only one worker hits the feeds per poll. Returns (alerts, complete), or
+    (None, False) when another worker is fetching right now."""
+    try:
+        ttl = int(max(10, min(_EAS_CACHE_TTL, int(interval) - 5)))
+    except Exception:
+        ttl = _EAS_CACHE_TTL
+    if not rc:
+        return _fetch_all_alerts_ex(settings, zones, severity_threshold)
+    try:
+        cached = rc.get(_EAS_REDIS_KEY)
+    except Exception:
+        cached = None
+    if cached:
+        try:
+            data = json.loads(cached)
+            if isinstance(data, dict):
+                return list(data.get("alerts") or []), bool(data.get("complete", True))
+            return list(data or []), True
+        except Exception:
+            pass
+    try:
+        if not rc.set(_EAS_REDIS_LOCK, "1", nx=True, ex=30):
+            return None, False
+    except Exception:
+        return _fetch_all_alerts_ex(settings, zones, severity_threshold)
+    try:
+        alerts, complete = _fetch_all_alerts_ex(settings, zones, severity_threshold)
+        try:
+            # A partial result is cached only briefly so a recovered feed is
+            # picked up quickly.
+            rc.setex(_EAS_REDIS_KEY, ttl if complete else min(ttl, 15),
+                     json.dumps({"alerts": alerts, "complete": complete, "ts": time.time()}))
+        except Exception:
+            pass
+        return alerts, complete
+    finally:
+        try:
+            rc.delete(_EAS_REDIS_LOCK)
+        except Exception:
+            pass
+
+def _eas_sort_key(a):
+    # Worst first; among equals, the earliest issued first.
+    return (-_EAS_SEV.get(a.get("severity"), 0), _norm_ts(a.get("effective")))
+
+def _eas_national_test_settings(settings):
+    """National test mode overrides area, source and severity: every active
+    alert in the US (NWS + IPAWS), any severity."""
+    if not settings.get("eas_national_test"):
+        return settings
+    s2 = dict(settings)
+    s2.update({"eas_source": "both", "eas_zones": "ALL", "eas_ipaws_same_codes": "ALL",
+               "eas_severity_filter": "Minor"})
+    return s2
 
 def _eas_sweep():
-    settings = _get_settings()
+    settings = _eas_national_test_settings(_get_settings())
     zones_raw = (settings.get("eas_zones") or "").strip()
     zones = [z.strip() for z in zones_raw.split(",") if z.strip()]
-    # Determine which sources are actually configured. IPAWS can run with no NWS
-    # zones at all, so "no zones" alone doesn't mean nothing is active.
     _source = (settings.get("eas_source") or "nws").lower()
     _ipaws_on = _source in ("ipaws", "both") and bool((settings.get("eas_ipaws_same_codes") or "").strip())
     _nws_on = _source in ("nws", "both") and bool(zones)
-    # Nothing configured — still need to clear any channels left in active EAS state
-    # (handles the source being removed while an alert was active)
-    if not _nws_on and not _ipaws_on:
-        rc = _get_redis_client()
-        current_state = {}
-        if rc:
-            try:
-                raw = rc.get(_EAS_STATE_KEY)
-                if raw:
-                    current_state = json.loads(raw)
-            except Exception:
-                pass
-        if not any(v for v in current_state.values()):
-            return  # nothing active, nothing to clear
-        mappings = _get_mappings()
-        from apps.channels.models import Channel
-        from core.models import StreamProfile
-        for cid, event in list(current_state.items()):
-            if not event:
-                continue
-            try:
-                mapping = mappings.get(cid, {}) or {}
-                channel = Channel.objects.filter(id=int(cid)).first()
-                if channel:
-                    _restore_profile(channel, mapping.get("original_profile_id"))
-                    eas_pid = mapping.get("eas_profile_id") or mapping.get("ticker_profile_id")
-                    if eas_pid:
-                        _delete_cloned_profile(eas_pid)
-                    mapping.pop("eas_profile_id", None)
-                    mapping.pop("ticker_profile_id", None)
-                    mappings[cid] = mapping
-                    _eas_clear(cid)
-                    _restart_channel_stream_async(channel, label="EAS")
-                    logger.info(f"[EmergencyAlertarr] EAS: cleared ch {cid} — no zones configured")
-            except Exception as e:
-                logger.error(f"[EmergencyAlertarr] EAS: clear failed ch {cid}: {e}")
-        _save_mappings(mappings)
-        if rc:
-            try:
-                rc.delete(_EAS_STATE_KEY)
-                rc.delete(_EAS_GLOBAL_KEY)
-            except Exception:
-                pass
-        return
-    severity_threshold = settings.get("eas_severity_filter") or "Moderate"
-    try:
-        silence_secs = max(10, min(20, int(settings.get("eas_silence_secs") or 15)))
-    except Exception:
-        silence_secs = 15
+
     mappings = _get_mappings()
-    eas_cids = [cid for cid, m in mappings.items() if m and (m.get("type") == "eas" or m.get("eas_armed"))]
+    eas_cids = [cid for cid, m in mappings.items()
+                if isinstance(m, dict) and (m.get("type") == "eas" or m.get("eas_armed"))]
     if not eas_cids:
         return
-
-    # One worker polls NWS; all others read from Redis cache.
-    alerts = None
     rc = _get_redis_client()
+
+    _mon_on = bool(_eas_chan(settings, "eas_monitor_channel"))
+    if not _nws_on and not _ipaws_on and not _mon_on:
+        # No alert source configured: nothing to poll. Restores still run on
+        # the tick; just make sure no channel is left on an orphaned overlay.
+        if any(mappings[c].get("eas_profile_id") and not mappings[c].get("eas_restore_at")
+               for c in eas_cids):
+            with _EasMutex(rc) as held:
+                if held:
+                    _eas_cleanup_orphans_locked(rc)
+        return
+
+    severity_threshold = settings.get("eas_severity_filter") or "Moderate"
     try:
-        if rc:
-            cached = rc.get(_EAS_REDIS_KEY)
-            if cached:
-                alerts = json.loads(cached)
-            else:
-                lock_acquired = rc.set(_EAS_REDIS_LOCK, "1", nx=True, ex=30)
-                if lock_acquired:
-                    try:
-                        alerts = _fetch_all_alerts(settings, zones, severity_threshold)
-                        rc.setex(_EAS_REDIS_KEY, _EAS_CACHE_TTL, json.dumps(alerts))
-                    except Exception as e:
-                        logger.warning(f"[EmergencyAlertarr] EAS: alert fetch failed: {e}")
-                        return
-                else:
-                    return  # another worker is fetching right now
+        interval = max(15, int(settings.get("eas_poll_interval") or 60))
+    except Exception:
+        interval = 60
+    try:
+        if _nws_on or _ipaws_on:
+            alerts, complete = _eas_get_alerts(rc, settings, zones, severity_threshold, interval)
         else:
-            alerts = _fetch_all_alerts(settings, zones, severity_threshold)
+            alerts, complete = [], True          # channel monitor only
     except Exception as e:
         logger.warning(f"[EmergencyAlertarr] EAS: alert fetch failed: {e}")
         return
+    if alerts is None:
+        return   # another worker is fetching right now
+    try:
+        alerts = list(alerts) + _eas_monitor_alerts(rc, settings)
+    except Exception as e:
+        logger.debug(f"[EmergencyAlertarr] monitor alerts unavailable: {e}")
 
-    # Sort all active alert RECORDS worst-first. Each NWS record is a single
-    # alert (its own event + its own areaDesc); we show one record at a time and
-    # never merge multiple records into a combined "ALERT / ALERT / ALERT + every
-    # county" screen. Extra records queue and play one per channel restore cycle
-    # via the seen-set logic below.
-    all_alerts = sorted(alerts or [], key=lambda a: _EAS_SEV.get(a["severity"], 0), reverse=True)
+    with _EasMutex(rc) as held:
+        if not held:
+            return   # another worker is mid-sweep; it has the same data
+        _eas_sweep_locked(rc, settings, alerts, complete)
 
-    # Read persisted alert state (shared across all workers via Redis).
-    current_state = {}
-    if rc:
-        try:
-            raw = rc.get(_EAS_STATE_KEY)
-            if raw:
-                current_state = json.loads(raw)
-        except Exception:
-            pass
-
-    # Read the last alert fingerprint announced system-wide (across ALL channels,
-    # not just this one). When every channel is EAS-armed, per-channel memory alone
-    # means each channel gets its own "first time seeing this alert" announcement --
-    # this global gate stops a switch to a not-yet-watched channel from re-announcing
-    # an alert that's already been shown elsewhere.
-    global_announced = None
-    if rc:
-        try:
-            global_announced = rc.get(_EAS_GLOBAL_KEY)
-            if isinstance(global_announced, bytes):
-                global_announced = global_announced.decode()
-        except Exception:
-            pass
-
-    # Channels currently being streamed (Redis channel_stream:{id} key exists).
-    # EAS only activates on channels with an active viewer; clears always run so
-    # profiles are restored even if the viewer stopped watching mid-alert.
-    streaming_ids = set()
-    if rc:
-        try:
-            for k in rc.keys("channel_stream:*"):
-                streaming_ids.add((k if isinstance(k, str) else k.decode()).split(":")[-1])
-        except Exception:
-            pass
-
-    now_ts = time.time()
-
-    # --- Timed restore + stream-resume anchoring ---------------------------
-    # Anchors each pending alert's restore countdown to actual stream resumption
-    # and restores finished channels. Runs every sweep (and also on the fast tick
-    # between sweeps) so restores survive worker reloads without daemon threads.
-    restore_changed = _eas_process_restores(mappings, streaming_ids, now_ts)
-    if restore_changed:
-        _save_mappings(mappings)
-        # Reload so the transition check below sees the cleared eas_restore_at
-        mappings = _get_mappings()
-
-    # --- One-at-a-time queue with a system-wide "seen" set -------------------
-    # We keep a set of alert IDs already announced. Each free, streaming channel
-    # takes the single worst not-yet-announced alert and shows it alone; the rest
-    # stay queued and play one per restore cycle. On the FIRST poll after a
-    # (re)start the whole current backlog is marked seen, so only alerts issued
-    # afterward ever fire (no flood of pre-existing alerts on startup).
-    active_id_set = {a.get("id", "") for a in all_alerts if a.get("id")}
-
-    # Acquire the owner lock BEFORE reading/deciding so the read-decide-write is
-    # atomic across Dispatcharr's multiple worker processes.
-    if rc and not rc.set(_EAS_OWNER_KEY, "1", nx=True, ex=120):
-        return
-
-    # Re-read shared alert state fresh now that we hold the lock.
-    if rc:
-        try:
-            raw = rc.get(_EAS_STATE_KEY)
-            current_state = json.loads(raw) if raw else {}
-        except Exception:
-            pass
-
-    # Read (or, on first poll, seed) the seen-set.
-    first_run = False
-    seen_ids = set()
-    if rc:
-        try:
-            raw_seen = rc.get(_EAS_SEEN_KEY)
-            if raw_seen is None:
-                first_run = True
-            else:
-                seen_ids = set(json.loads(raw_seen) or [])
-        except Exception:
-            seen_ids = set()
-    else:
-        first_run = not _eas_seen_mem["init"]
-        seen_ids = set(_eas_seen_mem["ids"])
-
-    if first_run:
-        # Invalidate the existing backlog: everything active right now counts as
-        # already announced, so nothing fires until a genuinely new alert arrives.
-        _eas_seen_write(rc, active_id_set)
-        if active_id_set:
-            logger.info(
-                f"[EmergencyAlertarr] EAS: first poll -- {len(active_id_set)} pre-existing "
-                "alert(s) invalidated; only newly issued alerts will be shown"
-            )
-        if rc:
-            try:
-                rc.delete(_EAS_OWNER_KEY)
-            except Exception:
-                pass
-        return
-
-    # Prune IDs that are no longer active (keeps the set bounded; NWS IDs are
-    # unique per issuance so a pruned ID never legitimately reappears), and
-    # refresh the TTL every sweep so the set stays alive while polling continues.
-    seen_ids &= active_id_set
-    _eas_seen_write(rc, seen_ids)
-
-    # The queue: active records not yet announced, worst-first.
-    queue = [a for a in all_alerts if a.get("id") and a.get("id") not in seen_ids]
-
-    # Assign the next queued alert to each free, streaming channel. Distinct free
-    # channels take distinct alerts; anything left over waits for the next cycle.
-    transitions = {}   # cid -> ("fire", alert_record) | ("clear", None)
-    pending = list(queue)
-    for cid in eas_cids:
-        mapping = mappings.get(cid, {})
-        if mapping.get("eas_restore_at"):
-            continue   # busy playing an alert; picks the next one when it restores
-        if mapping.get("eas_profile_id"):
-            # Leftover EAS profile with no restore scheduled: clean up only when
-            # NWS has nothing active, and never disturb a test overlay.
-            if not active_id_set and current_state.get(cid) != "__test__":
-                transitions[cid] = ("clear", None)
-            continue
-        if cid not in streaming_ids:
-            continue   # nobody watching -- don't activate
-        if pending:
-            transitions[cid] = ("fire", pending.pop(0))
-
-    if not transitions:
-        if rc:
-            try:
-                rc.delete(_EAS_OWNER_KEY)
-            except Exception:
-                pass
-        return
-
-    from apps.channels.models import Channel
-    from core.models import StreamProfile
-
-    new_state = dict(current_state)
+def _eas_cleanup_orphans_locked(rc):
+    """Restore channels left on an EAS profile with no restore scheduled
+    (crashed worker, lost write). Caller holds the mutex."""
+    mappings = _get_mappings()
     changed = False
+    for cid, m in list(mappings.items()):
+        if not isinstance(m, dict):
+            continue
+        if m.get("eas_profile_id") and not m.get("eas_restore_at") and not m.get("eas_await_stream"):
+            try:
+                _eas_do_restore(cid, m, mappings, rc)
+                changed = True
+                logger.info(f"[EmergencyAlertarr] EAS: cleaned up orphaned alert overlay on ch {cid}")
+            except Exception as e:
+                logger.error(f"[EmergencyAlertarr] EAS: orphan cleanup failed ch {cid}: {e}", exc_info=True)
+    if changed:
+        _save_mappings(mappings)
+    return changed
 
-    for cid, (action, alert) in transitions.items():
+def _eas_sweep_locked(rc, settings, alerts, complete):
+    """Decide and apply alert transitions. Caller holds the mutex."""
+    from apps.channels.models import Channel
+
+    _eas_cleanup_orphans_locked(rc)
+    mappings = _get_mappings()   # fresh, under the lock
+    eas_cids = [cid for cid, m in mappings.items()
+                if isinstance(m, dict) and (m.get("type") == "eas" or m.get("eas_armed"))]
+    streaming_ids = _eas_streaming_ids(rc)
+    now_ts = time.time()
+    changed = _eas_process_restores(mappings, streaming_ids, now_ts, rc)
+
+    all_alerts = sorted([a for a in (alerts or []) if a.get("id")], key=_eas_sort_key)
+
+    seen = _eas_seen_read(rc)
+    fp = _eas_cfg_fingerprint(settings)
+    fp_changed = seen is not None and _eas_cfg_fp_get(rc) not in (None, fp)
+    if seen is None or fp_changed:
+        # First poll after a (re)start -- or the area / source / severity
+        # settings changed: everything already active counts as announced, so
+        # only alerts issued from now on ever fire. (Without the re-seed on a
+        # settings change, switching area -- or to ALL -- queued that area's
+        # whole backlog, and the channels played alert after alert for hours.)
+        # Never seed from a partial fetch: the missing alerts would later look
+        # "new".
+        if complete:
+            merged = dict(seen or {})
+            merged.update({k: now_ts for a in all_alerts for k in _alert_keys(a)})
+            _eas_seen_write(rc, merged)
+            _eas_cfg_fp_set(rc, fp)
+            if all_alerts:
+                why = "alert area/source settings changed" if fp_changed else "first poll"
+                logger.info(
+                    f"[EmergencyAlertarr] EAS: {why} -- {len(all_alerts)} already-active "
+                    "alert(s) marked as announced; only newly issued alerts will be shown"
+                )
+        if changed:
+            _save_mappings(mappings)
+        return
+    if _eas_cfg_fp_get(rc) is None and complete:
+        _eas_cfg_fp_set(rc, fp)
+
+    # Refresh last-seen times for everything still in the feed, then forget
+    # entries that have been gone for a long time.
+    for a in all_alerts:
+        keys = _alert_keys(a)
+        if any(k in seen for k in keys):
+            for k in keys:
+                seen[k] = now_ts
+    seen = {k: t for k, t in seen.items() if now_ts - t < _EAS_SEEN_KEEP}
+
+    gap, max_age = _eas_flow_limits(settings)
+    pending = _eas_json_get(rc, _EAS_PENDING_KEY, {})
+    recent = _eas_json_get(rc, _EAS_RECENT_KEY, [])
+    recent = [r for r in recent if now_ts - float(r.get("seen", 0)) < 3 * 3600]
+    feed_keys = set()
+    queue = []
+    for a in all_alerts:
+        keys = _alert_keys(a)
+        feed_keys.update(keys)
+        k0 = keys[0]
+        if any(k in seen for k in keys):
+            pending.pop(k0, None)
+            continue
+        if any(r in seen for r in (a.get("refs") or [])):
+            # An update/extension/continuation of an alert that already played
+            # (NWS re-issues with a new expiry => new content ID). A real
+            # ENDEC doesn't re-tone these; absorb it silently.
+            for k in keys:
+                seen[k] = now_ts
+            logger.info(
+                f"[EmergencyAlertarr] EAS: {a.get('event')} update for an alert already "
+                "announced -- not re-announced"
+            )
+            continue
+        dup = _eas_recent_match(recent, a)
+        if dup:
+            # The same message from a second source (IPAWS + NWS, or a
+            # monitored station relaying an alert we already had): a real
+            # ENDEC never relays a duplicate (47 CFR 11.33(a)(10)).
+            for k in keys:
+                seen[k] = now_ts
+            pending.pop(k0, None)
+            logger.info(f"[EmergencyAlertarr] EAS: {a.get('event')} already received "
+                        f"(via {dup.get('src', 'another source')}) -- duplicate ignored")
+            continue
+        if (a.get("event_code") or "").upper() == "EAT":
+            # Emergency Action Termination: ends an active national alert.
+            if _eas_json_get(rc, _EAS_NATIONAL_KEY, None):
+                _eas_json_set(rc, _EAS_NATIONAL_KEY + ":eat", 1, 3600)
+        dec = decide(a, settings)
+        a["_priority"], a["_category"] = dec["priority"], dec["category"]
+        if k0 not in pending:
+            age = (now_ts - float(a.get("received") or now_ts)) if a.get("source") == "monitor" \
+                else _eas_alert_age_secs(a, now_ts)
+            if age is not None and age > max_age and dec["category"] != "national":
+                # Too old to be news (issued while nothing was polling). Real
+                # ENDECs drop stale messages too; mark it so it can't pile up.
+                for k in keys:
+                    seen[k] = now_ts
+                logger.info(
+                    f"[EmergencyAlertarr] EAS: {a.get('event')} issued {age / 60:.0f} min ago -- "
+                    "too old, not announced"
+                )
+                continue
+            recent.append(_eas_recent_entry(a, now_ts))
+            if dec["action"] == "ignore":
+                for k in keys:
+                    seen[k] = now_ts
+                logger.info(f"[EmergencyAlertarr] EAS: {a.get('event')} received -- ignored by filter")
+                continue
+            if dec["action"] == "log":
+                for k in keys:
+                    seen[k] = now_ts
+                logger.info(f"[EmergencyAlertarr] EAS: {a.get('event')} received -- logged, not aired (filter)")
+                _eas_history_add(a.get("event") or "Alert", a.get("area") or "", [],
+                                 kind="logged", severity=a.get("severity") or "")
+                continue
+            pending[k0] = {"first": now_ts, "hold": dec["hold_min"]}
+            if dec["hold_min"]:
+                logger.info(f"[EmergencyAlertarr] EAS: {a.get('event')} received -- held "
+                            f"{dec['hold_min']:.0f} min before relay (filter)")
+        p = pending.get(k0) or {"first": now_ts, "hold": 0}
+        if now_ts < float(p.get("first", now_ts)) + float(p.get("hold", 0)) * 60:
+            continue
+        queue.append(a)
+    if complete:
+        pending = {k: v for k, v in pending.items() if k in feed_keys}
+    queue.sort(key=lambda x: (-x.get("_priority", 40), _eas_sort_key(x)))
+
+    # One alert at a time, system-wide, like a real ENDEC: while any channel
+    # is still playing an alert the next one waits -- unless the new one may
+    # interrupt it (a national alert takes over from anything; a warning may
+    # cut into a test). The alert goes out on EVERY armed channel with a
+    # viewer.
+    excluded = _eas_excluded_cids(settings)
+    busy = [c for c in eas_cids
+            if mappings[c].get("eas_restore_at") or mappings[c].get("eas_await_stream")]
+    running_prio = max((int(mappings[c].get("eas_priority") or 40) for c in busy), default=None)
+    air_until, air_prio = _eas_air_get(rc, now_ts)
+    if air_until:
+        # The last alert's slot is still running, even if its viewers left.
+        busy = busy or ["(on the air)"]
+        running_prio = max(running_prio if running_prio is not None else 0, air_prio)
+    top = queue[0] if queue else None
+    preempt = bool(top and busy and can_preempt(top.get("_priority", 40), running_prio))
+    last_end = _eas_last_end(rc)
+    if last_end > now_ts + 5:
+        last_end = 0.0            # clock went backwards: don't block alerts for hours
+    wait = gap - (now_ts - last_end)
+    urgent = bool(top and top.get("_priority", 40) >= 61)     # EAN / NPT: immediately
+    if top and not busy and wait > 0 and not urgent:
+        logger.debug(f"[EmergencyAlertarr] EAS: next alert in {wait:.0f}s (spacing between alerts)")
+    if top and (not busy or preempt) and (wait <= 0 or urgent or preempt):
+        targets = [c for c in eas_cids
+                   if c in streaming_ids and c not in excluded
+                   and (preempt or not mappings[c].get("eas_profile_id"))]
+        logger.info(f"[EmergencyAlertarr] EAS: {top.get('event')} due -- {len(targets)} of "
+                    f"{len(eas_cids)} armed channel(s) being watched"
+                    + (f": {', '.join(targets[:10])}" if targets else ""))
+        if targets:
+            alert = top
+            if preempt:
+                logger.warning(f"[EmergencyAlertarr] EAS: {alert.get('event')} (priority "
+                               f"{alert.get('_priority')}) interrupts the alert on the air")
+            fired_names = _eas_fire_on(rc, settings, mappings, targets, alert, now_ts)
+            if fired_names:
+                changed = True
+                for k in _alert_keys(alert):
+                    seen[k] = now_ts
+                pending.pop(_alert_keys(alert)[0], None)
+                still = len(queue) - 1
+                if still:
+                    logger.info(f"[EmergencyAlertarr] EAS: {still} more alert(s) queued")
+                _eas_history_add(
+                    alert.get("event") or "Alert", alert.get("area") or "",
+                    fired_names, kind="alert", severity=alert.get("severity") or "",
+                )
+                slot = max([float(mappings[c].get("eas_stream_end") or mappings[c].get("eas_seq_secs") or 0)
+                            for c in targets if isinstance(mappings.get(c), dict)] or [0.0])
+                _eas_air_set(rc, now_ts + max(slot, 20.0) + 5.0, alert.get("_priority", 40))
+        else:
+            # Nobody is watching an armed channel right now: the alert still
+            # "goes out" (to no one) and is done -- it is NOT kept for whoever
+            # tunes in next. Someone flipping over within the join window
+            # still gets it.
+            alert = top
+            for k in _alert_keys(alert):
+                seen[k] = now_ts
+            pending.pop(_alert_keys(alert)[0], None)
+            _eas_open_windows(rc, alert, now_ts)
+            _eas_air_set(rc, now_ts + _EAS_UNWATCHED_AIR_SECS, alert.get("_priority", 40))
+            _eas_history_add(alert.get("event") or "Alert", alert.get("area") or "", [],
+                             kind="unwatched", severity=alert.get("severity") or "")
+            logger.info(f"[EmergencyAlertarr] EAS: {alert.get('event')} went out with no one watching "
+                        f"an armed channel -- not shown")
+
+    # A national alert holds the channels until it is over (no timeout, no
+    # automatic reset -- 47 CFR 11.33(a)(9)); then the EOM goes out. Checked
+    # BEFORE the late-joiner pass, so an ended alert can never be re-fired.
+    if _eas_national_end_check(rc, settings, mappings, feed_keys, complete, now_ts):
+        changed = True
+    elif _eas_national_join_locked(rc, settings, mappings, streaming_ids):
+        changed = True
+
+    _eas_json_set(rc, _EAS_PENDING_KEY, pending, 6 * 3600)
+    _eas_json_set(rc, _EAS_RECENT_KEY, recent[-300:], 6 * 3600)
+    _eas_seen_write(rc, seen)
+    if changed:
+        _save_mappings(mappings)
+    _eas_watchdog_locked(rc)
+
+def _eas_json_get(rc, key, default):
+    """Shared state lives in Redis. The in-process copy is only a fallback for
+    when Redis is unreachable -- never for a key that was deleted (another
+    worker's "Stop All Alerts" / end of a national alert)."""
+    if rc:
+        try:
+            v = rc.get(key)
+            if v is None:
+                return default
+            return json.loads(v.decode() if isinstance(v, bytes) else v)
+        except Exception:
+            pass
+    mem = _eas_json_mem.get(key)
+    return default if mem is None else mem
+
+def _eas_json_set(rc, key, value, ttl=3600):
+    _eas_json_mem[key] = value
+    if rc:
+        try:
+            rc.setex(key, int(ttl), json.dumps(value))
+        except Exception:
+            pass
+
+def _eas_json_del(rc, key):
+    _eas_json_mem.pop(key, None)
+    if rc:
+        try:
+            rc.delete(key)
+        except Exception:
+            pass
+
+def _eas_origin_ts(a):
+    from datetime import datetime, timezone
+    for f in ("sent", "effective"):
+        raw = (a.get(f) or "").strip()
+        if raw:
+            try:
+                dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except Exception:
+                continue
+    return None
+
+def _eas_recent_entry(a, now_ts):
+    codes = sorted({"".join(ch for ch in str(c) if ch.isdigit()).zfill(6)[1:6]
+                    for c in (a.get("same_codes") or []) if str(c).strip()})
+    origin = a.get("sent") or a.get("effective")
+    try:
+        purge = a.get("same_purge") or _same_purge_code(origin, a.get("expires"))
+    except Exception:
+        purge = ""
+    return {"key": _alert_keys(a)[0], "ec": _same_event_code_for(a), "codes": codes,
+            "ts": _eas_origin_ts(a) or now_ts, "seen": now_ts, "purge": purge,
+            "src": a.get("source") or "feed", "event": a.get("event") or ""}
+
+def _eas_recent_match(recent, a):
+    """A previously received alert that is the same message as `a` from a
+    different source: same event code, overlapping locations, origination
+    time within a few minutes. Only cross-checks a monitored-channel alert
+    against the feeds (feed-vs-feed duplicates are merged upstream)."""
+    keys = set(_alert_keys(a))
+    me = _eas_recent_entry(a, 0)
+    mine_mon = (a.get("source") == "monitor")
+    for r in recent:
+        if r.get("key") in keys:
+            continue
+        if not (mine_mon or r.get("src") == "monitor"):
+            continue
+        if r.get("ec") != me["ec"]:
+            continue
+        rc_, mc = set(r.get("codes") or []), set(me["codes"])
+        same_set = rc_ == mc
+        same_purge = bool(r.get("purge")) and r.get("purge") == me["purge"]
+        # The same message relayed keeps the originator's time (minute
+        # precision) and either the exact location list or its valid period.
+        if not (same_set or (same_purge and (rc_ & mc))):
+            continue
+        if abs(float(r.get("ts") or 0) - float(me["ts"] or 0)) <= 150:
+            return r
+    return None
+
+def _eas_excluded_cids(settings):
+    """Channels that never get alerts: the force-tune details channel and the
+    channel being monitored for tones."""
+    out = set()
+    for key in ("eas_details_channel", "eas_monitor_channel"):
+        v = _eas_chan(settings, key)
+        if v:
+            out.add(v)
+    return out
+
+def _eas_national_hold_secs(alert, now_ts):
+    """How long a national alert may hold the channels at most: until it
+    expires, capped at two hours (a live address can't run forever here).
+    0 once it has expired."""
+    from datetime import datetime, timezone
+    raw = (alert.get("expires") or "").strip()
+    if not raw:
+        return 2 * 3600
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, min(dt.timestamp() - now_ts, 2 * 3600))
+    except Exception:
+        return 2 * 3600
+
+def _eas_fire_on(rc, settings, mappings, targets, alert, now_ts, eom_only=False):
+    """Put `alert` on the given channels (mappings updated in place, streams
+    kicked). Returns the names of the channels it fired on."""
+    from apps.channels.models import Channel
+    fired_names = []
+    to_kick = []
+    if not eom_only:
+        try:
+            cfg0 = _eas_fire_cfg(settings)
+            if cfg0.get("cable_mode") == "retune" and cfg0.get("style") not in _EAS_LIVE_STYLE_KEYS:
+                chans = [c for c in (Channel.objects.filter(id=int(x)).first() for x in targets) if c]
+                _eas_capture_retune_frames(cfg0, chans)
+        except Exception as e:
+            logger.debug(f"[EmergencyAlertarr] retune frames unavailable: {e}")
+    for cid in targets:
         mapping = mappings.get(cid, {})
         try:
+            _eas_mutex_touch()
             channel = Channel.objects.filter(id=int(cid)).first()
             if not channel:
                 continue
-
-            if action == "fire":
-                # One alert record -> one clean single-alert overlay. Clone a
-                # fresh EAS profile and schedule the timed restore.
-                if mapping.get("ticker_profile_id"):
-                    _restore_profile(channel, mapping.get("original_profile_id"))
-                    _delete_cloned_profile(mapping["ticker_profile_id"])
-                    mapping.pop("ticker_profile_id", None)
-
-                if mapping.get("eas_profile_id"):
-                    _delete_cloned_profile(mapping["eas_profile_id"])
-                    mapping.pop("eas_profile_id", None)
-
-                orig = StreamProfile.objects.filter(id=mapping.get("original_profile_id")).first()
-                if not orig:
-                    logger.warning(f"[EmergencyAlertarr] EAS: original profile missing for ch {cid}")
-                    continue
-
-                single = [alert]   # exactly one alert on screen -- never combined
-
-                transcode_mode = settings.get("eas_transcode_mode") or "full"
-                overlay_style = (settings.get("eas_overlay_style") or "easyplus").lower()
-                use_tts = bool(settings.get("eas_tts_enabled", True))
-                generate_tones = bool(settings.get("eas_generate_tones", False))
-                try:
-                    att_secs = max(4.0, min(30.0, float(settings.get("eas_att_secs") or 8)))
-                except Exception:
-                    att_secs = 8.0
-                _ep_font, _ep_scale = _easyplus_settings(settings)
-                _lead_in = float(settings.get("eas_lead_in_secs") or 0)
-                eas_profile, _, seq_duration = _clone_and_inject_eas(
-                    channel.id, orig, channel.name, silence_secs, transcode_mode,
-                    style=overlay_style, unique_alerts=single, use_tts=use_tts,
-                    generate_tones=generate_tones, att_secs=att_secs,
-                    easyplus_font=_ep_font, easyplus_scale=_ep_scale,
-                    lead_in_secs=_lead_in,
-                )
-                _assign_profile(channel, eas_profile)
-                _eas_write_alert(cid, single, style=overlay_style)
-
-                mapping["eas_profile_id"] = eas_profile.id
-                _eas_arm_restore(mapping, seq_duration, now_ts)
-                mappings[cid] = mapping
-                seen_ids.add(alert.get("id", ""))
-                new_state[cid] = alert.get("id", "") or "EAS"
-                still_queued = len([a for a in queue if a.get("id") not in seen_ids])
-                logger.info(
-                    f"[EmergencyAlertarr] EAS ALERT: {alert.get('event')} -- "
-                    f"{(alert.get('area') or '')[:60]} (ch {cid}, "
-                    f"restore in {seq_duration:.0f}s"
-                    + (f", {still_queued} more queued)" if still_queued else ")")
-                )
-                _eas_history_add(
-                    alert.get("event") or "Alert", alert.get("area") or "",
-                    channel.name, kind="alert", severity=alert.get("severity") or "",
-                )
-                _restart_channel_stream_async(channel, label="EAS", proactive=True)
-
-                with _eas_lock:
-                    _eas_active[cid] = alert.get("event") or "EAS"
-
-            else:  # action == "clear"
-                eas_pid = mapping.get("eas_profile_id") or mapping.get("ticker_profile_id")
-                _restore_profile(channel, mapping.get("original_profile_id"))
-                if eas_pid:
-                    _delete_cloned_profile(eas_pid)
-                mapping.pop("eas_profile_id", None)
-                mapping.pop("ticker_profile_id", None)
-                mapping.pop("eas_restore_at", None)
-                mappings[cid] = mapping
-                _eas_clear(cid)
-                new_state[cid] = None
-                logger.info(f"[EmergencyAlertarr] EAS: alert cleared -- ch {cid}")
-                _restart_channel_stream_async(channel, label="EAS")
-
-                with _eas_lock:
-                    _eas_active.pop(cid, None)
-
-            changed = True
-
+            seq_duration = _eas_activate(channel, mapping, [dict(alert)], settings, now_ts=now_ts,
+                                         eom_only=eom_only)
+            mappings[cid] = mapping
+            _eas_state_set(rc, cid, alert.get("id") or "EAS")
+            to_kick.append(channel)
+            with _eas_lock:
+                _eas_active[cid] = alert.get("event") or "EAS"
+            fired_names.append(channel.name)
+            logger.info(
+                f"[EmergencyAlertarr] EAS {'EOM' if eom_only else 'ALERT'}: {alert.get('event')} -- "
+                f"{(alert.get('area') or '')[:60]} (ch {cid}, sequence {seq_duration:.0f}s)"
+            )
         except Exception as e:
-            logger.error(f"[EmergencyAlertarr] EAS: transition failed ch {cid}: {e}", exc_info=True)
+            logger.error(f"[EmergencyAlertarr] EAS: activation failed ch {cid}: {e}", exc_info=True)
+    # Switch every channel only once ALL alert profiles are built: building
+    # one (text layout, tones, audio render) is CPU work inside Dispatcharr's
+    # own worker, and doing it while another channel was being torn down
+    # stalled that teardown -- the old session then broke the new one and the
+    # player hung (timeout / 504) instead of showing the alert.
+    for channel in to_kick:
+        try:
+            _eas_kick(channel, rc)
+        except Exception as e:
+            logger.error(f"[EmergencyAlertarr] EAS: switch failed ch {channel.id}: {e}")
+    if fired_names and not eom_only:
+        # Someone flipping channels right as the alert goes out still gets it.
+        _eas_open_windows(rc, alert, now_ts)
+    return fired_names
 
-    # Persist the seen-set including the IDs just announced.
-    _eas_seen_write(rc, seen_ids & active_id_set if active_id_set else seen_ids)
+def _eas_air_get(rc, now_ts=None):
+    """(until, priority) of the alert slot on the air, or (0, None)."""
+    a = _eas_json_get(rc, _EAS_AIR_KEY, None)
+    now_ts = now_ts or time.time()
+    try:
+        until = float((a or {}).get("until") or 0)
+    except Exception:
+        until = 0.0
+    if until > now_ts + 4 * 3600:
+        until = 0.0                 # clock went backwards
+    if until <= now_ts:
+        return 0.0, None
+    return until, int((a or {}).get("prio") or 40)
 
-    if changed:
-        _save_mappings(mappings)
-        if rc:
-            try:
-                rc.setex(_EAS_STATE_KEY, 3600, json.dumps(new_state))
-            except Exception:
-                pass
+def _eas_air_set(rc, until, prio):
+    _eas_json_set(rc, _EAS_AIR_KEY, {"until": float(until), "prio": int(prio or 40)},
+                  int(max(60, until - time.time() + 60)))
 
+def _eas_open_windows(rc, alert, now_ts):
+    """After an alert goes out (on channels or to nobody): open the 5 s join
+    window, or -- for a national alert -- the hold that late joiners get."""
+    if _eas_classify(alert) != "national":
+        _eas_json_set(rc, _EAS_JOIN_KEY, {"alert": alert, "until": time.time() + _EAS_JOIN_SECS}, 120)
+        return
+    old = _eas_json_get(rc, _EAS_NATIONAL_KEY, None)
+    since = now_ts
+    if old and set(old.get("keys") or []) & set(_alert_keys(alert)):
+        since = float(old.get("since") or now_ts)      # a late joiner: same alert
+    _eas_json_set(rc, _EAS_NATIONAL_KEY, {"alert": alert, "keys": _alert_keys(alert),
+                                         "since": since,
+                                         "until": since + _eas_national_hold_secs(alert, since)},
+                  4 * 3600)
+
+def _eas_manual_fire(channels, alert, settings):
+    """Test / injected alert from the plugin page. Like real alerts (and like
+    the old version's Test button) it only goes on armed channels someone is
+    WATCHING -- with every channel armed, the old loop built an alert profile
+    for every single channel inside the web request, which took minutes,
+    ended in a 504, and the watched channel often never got its turn.
+    Caller holds the EAS mutex. Returns (fired_names, notes)."""
+    rc = _get_redis_client()
+    notes = []
+    mappings = _get_mappings()
+    watched = _eas_streaming_ids(rc)
+    excluded = _eas_excluded_cids(settings)
+    not_armed = unwatched = 0
+    busy = []
+    targets = []
+    for ch in channels:
+        cid = str(ch.id)
+        m = mappings.get(cid)
+        if not isinstance(m, dict) or not (m.get("type") == "eas" or m.get("eas_armed")):
+            not_armed += 1
+            continue
+        if cid in excluded:
+            continue
+        if m.get("eas_profile_id") or m.get("eas_restore_at") or m.get("eas_await_stream"):
+            busy.append(ch.name)
+            continue
+        if cid not in watched:
+            unwatched += 1
+            continue
+        targets.append(cid)
+    now_ts = time.time()
+    fired = []
+    if targets:
+        fired = _eas_fire_on(rc, settings, mappings, targets, dict(alert), now_ts)
+        if fired:
+            _save_mappings(mappings)
+            slot = max([float(mappings[c].get("eas_stream_end") or mappings[c].get("eas_seq_secs") or 0)
+                        for c in targets if isinstance(mappings.get(c), dict)] or [0.0])
+            prio = max([int(mappings[c].get("eas_priority") or 40)
+                        for c in targets if isinstance(mappings.get(c), dict)] or [40])
+            _eas_air_set(rc, now_ts + max(slot, 20.0) + 5.0, prio)
+    elif _eas_classify(alert) != "national":
+        # Nobody watching right now: anyone tuning in within the next few
+        # seconds still gets it (same 5 s window as real alerts).
+        _eas_open_windows(rc, alert, now_ts)
+    if busy:
+        notes.append(f"Already playing an alert: {', '.join(busy[:10])}"
+                     + (f" +{len(busy) - 10} more" if len(busy) > 10 else ""))
+    if unwatched:
+        notes.append(f"Not sent to {unwatched} armed channel(s) nobody is watching"
+                     + ("" if fired else " -- tune to an armed channel, then run it again"
+                        " (anyone tuning in within 5 seconds still gets it)"))
+    if not_armed:
+        notes.append(f"{not_armed} selected channel(s) aren't armed for EAS")
+    return fired, notes
+
+def _eas_join_window_locked(rc, settings, mappings, streaming_ids):
+    """Within _EAS_JOIN_SECS of an alert going out, armed channels that start
+    being watched (someone flipped over right as it switched on) get the same
+    alert. Returns True if anything fired."""
+    win = _eas_json_get(rc, _EAS_JOIN_KEY, None)
+    if not win or not win.get("alert"):
+        return False
+    if time.time() > float(win.get("until") or 0):
+        _eas_json_del(rc, _EAS_JOIN_KEY)
+        return False
+    excluded = _eas_excluded_cids(settings)
+    targets = [cid for cid, m in mappings.items()
+               if isinstance(m, dict) and (m.get("type") == "eas" or m.get("eas_armed"))
+               and cid in streaming_ids and cid not in excluded and not m.get("eas_profile_id")]
+    if not targets:
+        return False
+    keep = dict(win)
+    fired = _eas_fire_on(rc, settings, mappings, targets, win["alert"], time.time())
+    _eas_json_set(rc, _EAS_JOIN_KEY, keep, 120)     # fire_on re-opened it; keep the original end
+    if fired:
+        logger.info(f"[EmergencyAlertarr] EAS: viewer tuned in as the alert went out -- also on "
+                    f"{', '.join(fired)}")
+    return bool(fired)
+
+def _eas_national_join_locked(rc, settings, mappings, streaming_ids):
+    """While a national alert is on, anyone who tunes to an armed channel gets
+    it too (it isn't a one-shot like a normal alert). Returns True if changed."""
+    nat = _eas_json_get(rc, _EAS_NATIONAL_KEY, None)
+    if not nat or not nat.get("alert"):
+        return False
+    if time.time() >= float(nat.get("until") or 0):
+        return False                     # over; the sweep's end check sends the EOM
+    excluded = _eas_excluded_cids(settings)
+    targets = [cid for cid, m in mappings.items()
+               if isinstance(m, dict) and (m.get("type") == "eas" or m.get("eas_armed"))
+               and cid in streaming_ids and cid not in excluded and not m.get("eas_profile_id")]
+    if not targets:
+        return False
+    return bool(_eas_fire_on(rc, settings, mappings, targets, nat["alert"], time.time()))
+
+def _eas_national_end_check(rc, settings, mappings, feed_keys, complete, now_ts):
+    """End a national alert once it has left the feed (or expired): send the
+    EOM on every channel holding it, then they restore normally."""
+    nat = _eas_json_get(rc, _EAS_NATIONAL_KEY, None)
+    holding = [cid for cid, m in mappings.items() if isinstance(m, dict) and m.get("eas_national")]
+    if not nat:
+        return False
+    alert = nat.get("alert") or {}
+    gone = complete and not (set(nat.get("keys") or []) & set(feed_keys))
+    expired = now_ts >= float(nat.get("until") or 0)
+    terminated = bool(_eas_json_get(rc, _EAS_NATIONAL_KEY + ":eat", None))
+    if not (gone or expired or terminated):
+        return False
+    _eas_json_del(rc, _EAS_NATIONAL_KEY + ":eat")
+    _eas_json_del(rc, _EAS_NATIONAL_KEY)
+    logger.info(f"[EmergencyAlertarr] EAS: national alert over -- sending EOM on {len(holding)} channel(s)")
+    if holding:
+        _eas_fire_on(rc, settings, mappings, holding, alert, now_ts, eom_only=True)
+    return True
+
+def _eas_cfg_fingerprint(settings):
+    """The settings that decide WHICH alerts are in the feed."""
+    parts = [
+        (settings.get("eas_source") or "nws").lower(),
+        ",".join(sorted(z.strip().upper() for z in (settings.get("eas_zones") or "").split(",") if z.strip())),
+        ",".join(sorted(c.strip() for c in (settings.get("eas_ipaws_same_codes") or "").split(",") if c.strip())),
+        (settings.get("eas_severity_filter") or "Moderate").lower(),
+    ]
+    return "|".join(parts)
+
+def _eas_cfg_fp_get(rc):
     if rc:
         try:
-            rc.delete(_EAS_OWNER_KEY)
+            v = rc.get(_EAS_CFG_FP_KEY)
+            if v is not None:
+                return v.decode() if isinstance(v, bytes) else str(v)
+            return None
         except Exception:
             pass
+    return _eas_seen_mem.get("fp")
+
+def _eas_cfg_fp_set(rc, fp):
+    _eas_seen_mem["fp"] = fp
+    if rc:
+        try:
+            rc.setex(_EAS_CFG_FP_KEY, _EAS_SEEN_TTL, fp)
+        except Exception:
+            pass
+
+def _eas_all_mode(settings):
+    zones = [z.strip().upper() for z in (settings.get("eas_zones") or "").split(",") if z.strip()]
+    codes = (settings.get("eas_ipaws_same_codes") or "").strip().upper()
+    src = (settings.get("eas_source") or "nws").lower()
+    return ((src in ("nws", "both") and zones == ["ALL"])
+            or (src in ("ipaws", "both") and codes == "ALL"))
+
+def _eas_flow_limits(settings):
+    """(seconds of quiet between two alerts, max alert age in seconds)."""
+    try:
+        gap = int(settings.get("eas_alert_gap_secs") if settings.get("eas_alert_gap_secs") not in (None, "")
+                  else _EAS_DEFAULT_GAP_SECS)
+    except Exception:
+        gap = _EAS_DEFAULT_GAP_SECS
+    gap = max(0, min(3600, gap))
+    if _eas_all_mode(settings):
+        gap = max(gap, _EAS_ALL_MODE_GAP_SECS)     # nationwide: never back-to-back
+    try:
+        age_min = int(settings.get("eas_max_alert_age_min") or _EAS_DEFAULT_MAX_AGE_MIN)
+    except Exception:
+        age_min = _EAS_DEFAULT_MAX_AGE_MIN
+    age_min = max(5, min(720, age_min))
+    return float(gap), float(age_min * 60)
+
+def _eas_alert_age_secs(a, now_ts):
+    """Seconds since the alert was issued (CAP 'sent', else 'effective');
+    None if unknown or in the future."""
+    from datetime import datetime, timezone
+    for f in ("sent", "effective"):
+        raw = (a.get(f) or "").strip()
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age = now_ts - dt.timestamp()
+            return age if age > 0 else None
+        except Exception:
+            continue
+    return None
+
+def _eas_channel_meta_profile(rc, channel_uuid):
+    """Stream profile id the channel's live session was started with, or None."""
+    if not rc:
+        return None
+    try:
+        from apps.proxy.live_proxy.redis_keys import RedisKeys
+        key = RedisKeys.channel_metadata(channel_uuid)
+    except Exception:
+        key = f"live:channel:{channel_uuid}:metadata"
+    try:
+        v = rc.hget(key, "stream_profile")
+        if v is None:
+            return None
+        return (v.decode() if isinstance(v, bytes) else str(v)).strip() or None
+    except Exception:
+        return None
+
+def _eas_watchdog_locked(rc):
+    """Safety net for 'alert stuck on screen'. Caller holds the mutex.
+
+    1. A channel whose profile in the database is still one of our alert
+       profiles while no alert is running on it is put back (mappings lost,
+       crash between steps, manual edits).
+    2. A channel whose LIVE session is still running an alert profile while no
+       alert is active (the restore's stream restart was missed or failed) is
+       stopped so the viewer reconnects on the normal profile. Rate-limited per
+       channel.
+
+    Cost is independent of how many channels are armed: (1) asks the database
+    only for channels that point at one of our alert profiles (normally none),
+    and (2) only looks at channels someone is watching. The old version
+    loaded every armed channel (plus its override and profile) every pass --
+    thousands of queries with all channels armed, holding the plugin lock
+    long enough to delay alerts and slow Dispatcharr down."""
+    try:
+        from apps.channels.models import Channel
+        from core.models import StreamProfile
+    except Exception:
+        return
+    mappings = _get_mappings()
+    changed = False
+    clone_ids = _eas_clone_ids(rc)
+
+    def _armed_idle(cid):
+        m = mappings.get(cid)
+        return (isinstance(m, dict) and (m.get("type") == "eas" or m.get("eas_armed"))
+                and not (m.get("eas_profile_id") or m.get("eas_restore_at") or m.get("eas_await_stream")))
+
+    # 1. Channels still pointing at an alert profile in the database.
+    try:
+        db_clones = [p.id for p in StreamProfile.objects.filter(name__startswith=PROFILE_PREFIX)]
+    except Exception:
+        db_clones = []
+    clone_ids |= {str(i) for i in db_clones}
+    suspects = {}
+    if db_clones:
+        for kw in ({"stream_profile_id__in": db_clones}, {"override__stream_profile_id__in": db_clones}):
+            try:
+                for ch in Channel.objects.filter(**kw):
+                    suspects[str(ch.id)] = ch
+            except Exception:
+                pass
+    for cid, channel in suspects.items():
+        if not _armed_idle(cid):
+            continue            # an alert is legitimately running here (or not ours)
+        try:
+            eff = _eas_effective_profile(channel)
+        except Exception:
+            eff = None
+        if eff is None or not (eff.name or "").startswith(PROFILE_PREFIX):
+            continue
+        logger.warning(f"[EmergencyAlertarr] EAS watchdog: ch {cid} left on alert profile "
+                       f"{eff.id} with no alert running -- restoring")
+        orig = mappings[cid].get("original_profile_id")
+        if orig and str(orig) == str(eff.id):
+            orig = None
+        try:
+            _restore_profile(channel, orig, slot=_eas_profile_slot(channel)[0])
+        except Exception as e:
+            logger.error(f"[EmergencyAlertarr] EAS watchdog: restore ch {cid} failed: {e}")
+        _eas_clone_remember(rc, eff.id)
+        clone_ids.add(str(eff.id))
+        _delete_cloned_profile(eff.id)
+        changed = True
+
+    # 2. Live sessions (watched channels only) still running an alert profile.
+    if clone_ids and time.time() - _eas_last_end(rc) >= 20:
+        try:
+            watched = _eas_streaming_ids(rc)
+        except Exception:
+            watched = set()
+        for cid in watched:
+            if not _armed_idle(cid):
+                continue
+            try:
+                channel = Channel.objects.filter(id=int(cid)).first()
+            except Exception:
+                channel = None
+            if not channel:
+                continue
+            live_pid = _eas_channel_meta_profile(rc, str(channel.uuid))
+            if not (live_pid and live_pid in clone_ids):
+                continue
+            ok = True
+            if rc:
+                try:
+                    ok = bool(rc.set(f"{_EAS_WD_PREFIX}{cid}", "1", nx=True, ex=30))
+                except Exception:
+                    ok = True
+            if ok:
+                logger.warning(f"[EmergencyAlertarr] EAS watchdog: ch {cid} is still streaming alert "
+                               f"profile {live_pid} after its alert ended -- restarting the stream")
+                _restart_channel_stream_async(channel, label="EAS watchdog")
+    if changed:
+        _save_mappings(mappings)
 
 def _eas_sweep_loop(stop_event):
     logger.info("[EmergencyAlertarr] EAS module initialized.")
@@ -2119,10 +3477,6 @@ def _eas_sweep_loop(stop_event):
             except Exception:
                 pass
             _eas_sweep()
-            try:
-                _eas_ensure_monitor(_get_settings())   # start/stop live SAME monitor
-            except Exception as _me:
-                logger.error(f"[EmergencyAlertarr] monitor manage error: {_me}", exc_info=True)
         except Exception as e:
             logger.error(f"[EmergencyAlertarr] EAS loop error: {e}", exc_info=True)
         finally:
@@ -2132,8 +3486,8 @@ def _eas_sweep_loop(stop_event):
             except Exception:
                 pass
         # Sleep until the next full poll, but run a fast, network-free restore
-        # check every few seconds so the overlay window is timed accurately
-        # (anchored to stream resumption) instead of only once per poll interval.
+        # check every couple of seconds so the overlay window is timed
+        # accurately instead of only once per poll interval.
         slept = 0
         while slept < interval and not stop_event.is_set():
             stop_event.wait(timeout=_EAS_TICK_SECS)
@@ -2142,6 +3496,17 @@ def _eas_sweep_loop(stop_event):
                 _eas_restore_tick()
             except Exception:
                 pass
+            try:
+                if _eas_monitor_new_pop(_get_redis_client()):
+                    break      # a monitored channel just aired an alert: sweep now
+            except Exception:
+                pass
+            finally:
+                try:
+                    from django.db import connection
+                    connection.close()
+                except Exception:
+                    pass
 
 def _get_mappings():
     try:
@@ -2163,6 +3528,8 @@ def _eas_scheduled_test_due(settings, now_local, last_key):
       eas_test_hour:     0..23 (local hour the test fires)
     """
     mode = (settings.get("eas_test_schedule") or "off").lower()
+    if mode == "realistic":
+        return _eas_realistic_test_due(settings, now_local, last_key)
     if mode not in ("weekly", "monthly"):
         return None
     try:
@@ -2192,101 +3559,103 @@ def _eas_scheduled_test_due(settings, now_local, last_key):
         return None
     return window_key
 
-def _eas_fire_scheduled_test():
+def _eas_realistic_plan(settings, year, month):
+    """This month's RMT start time + the set of ISO weeks it covers.
+
+    47 CFR 11.61(a)(1): RMTs run between 8:30 a.m. and local sunset in odd
+    months and between sunset and 8:30 a.m. in even months. The day is the
+    configured day-of-month; the time is picked pseudo-randomly inside the
+    window (seeded by the month, so every worker agrees)."""
+    import random
+    from datetime import datetime
+    try:
+        dom = max(1, min(28, int(settings.get("eas_test_day", 1) or 1)))
+    except Exception:
+        dom = 1
+    rnd = random.Random(f"rmt-{_PLUGIN_KEY}-{year}-{month}")
+    if month % 2 == 1:
+        hour = rnd.randint(9, 16)               # daytime window, before sunset
+    else:
+        hour = rnd.choice([20, 21, 22, 23])     # night window, after sunset
+    minute = rnd.randint(0, 59)
+    return datetime(year, month, dom, hour, minute)
+
+def _eas_realistic_test_due(settings, now_local, last_key):
+    """'Realistic' schedule: one RMT a month inside the FCC window, and an RWT
+    at a random day/time every other week ("at random days and times"; none
+    in the week of the RMT, per 11.61(a)(2)). Returns (key, kind) or None."""
+    import random
+    from datetime import datetime, timedelta
+    naive = now_local.replace(tzinfo=None)
+    rmt = _eas_realistic_plan(settings, naive.year, naive.month)
+    if rmt <= naive < rmt + timedelta(minutes=45):
+        key = f"rmt-{naive.year}-{naive.month}"
+        return None if key == last_key else (key, "monthly")
+    iso = naive.isocalendar()
+    if rmt.isocalendar()[:2] == iso[:2]:
+        return None                              # RMT week: no RWT
+    rnd = random.Random(f"rwt-{_PLUGIN_KEY}-{iso[0]}-{iso[1]}")
+    day = rnd.randint(0, 6)
+    hour = rnd.randint(8, 21)
+    minute = rnd.randint(0, 59)
+    monday = (naive - timedelta(days=naive.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    when = monday + timedelta(days=day, hours=hour, minutes=minute)
+    if when <= naive < when + timedelta(minutes=45):
+        key = f"rwt-{iso[0]}-{iso[1]}"
+        return None if key == last_key else (key, "weekly")
+    return None
+
+def _eas_fire_scheduled_test(kind=None):
     """Fire a Required Weekly/Monthly Test across all EAS-armed channels that
     currently have a viewer, exactly like a real station's automated RWT/RMT.
-    Reuses the same clone/overlay/restore machinery as the sweep."""
+    Reuses the same activation/restore machinery as the sweep."""
     from apps.channels.models import Channel
-    from core.models import StreamProfile
     from datetime import datetime, timedelta, timezone as _tz
 
     settings = _get_settings()
-    mappings = _get_mappings()
     rc = _get_redis_client()
-    silence_secs   = max(10, min(20, int(settings.get("eas_silence_secs") or 15)))
-    transcode_mode = settings.get("eas_transcode_mode") or "full"
-    overlay_style  = (settings.get("eas_overlay_style") or "easyplus").lower()
-    use_tts        = bool(settings.get("eas_tts_enabled", True))
-    mode = (settings.get("eas_test_schedule") or "off").lower()
+    mode = kind or (settings.get("eas_test_schedule") or "off").lower()
     test_area = (settings.get("eas_test_area") or "").strip() or None
-    # Scheduled RMT plays the full sequence; only scheduled RWT is tones-only ENDEC.
-    endec_test = (mode == "weekly")   # RWT = tones-only ENDEC; RMT = full readout
-    generate_tones = bool(settings.get("eas_generate_tones", False))
-    try:
-        att_secs = max(4.0, min(30.0, float(settings.get("eas_att_secs") or 8)))
-    except Exception:
-        att_secs = 8.0
-    try:
-        tail_secs = max(1.0, min(30.0, float(settings.get("eas_endec_tail_secs") or 7.5)))
-    except Exception:
-        tail_secs = 7.5
 
-    # Which channels currently have a viewer (same gate the sweep uses).
-    streaming_ids = set()
-    if rc:
-        try:
-            for k in rc.keys("channel_stream:*"):
-                streaming_ids.add((k if isinstance(k, str) else k.decode()).split(":")[-1])
-        except Exception:
-            pass
+    fired = []
+    with _EasMutex(rc, wait=30) as held:
+        if not held:
+            logger.warning("[EmergencyAlertarr] EAS scheduled test skipped: plugin busy")
+            return 0
+        mappings = _get_mappings()
+        streaming_ids = _eas_streaming_ids(rc)
+        now_utc = datetime.now(_tz.utc)
+        for cid, mapping in list(mappings.items()):
+            if not isinstance(mapping, dict):
+                continue
+            if not (mapping.get("type") == "eas" or mapping.get("eas_armed")):
+                continue
+            if mapping.get("eas_profile_id") or mapping.get("eas_restore_at"):
+                continue  # already mid-alert
+            if cid not in streaming_ids:
+                continue  # nobody watching this one
+            if cid in _eas_excluded_cids(settings):
+                continue  # details / monitored channel
+            channel = Channel.objects.filter(id=int(cid)).first()
+            if not channel:
+                continue
+            fake_alerts = [_eas_build_test_alert(mode, now_utc, area=test_area)]
+            try:
+                seq_duration = _eas_activate(channel, mapping, fake_alerts, settings)
+                mappings[cid] = mapping
+                _eas_state_set(rc, cid, "__test__")
+                _eas_kick(channel, rc)
+                fired.append(channel.name)
+            except Exception as e:
+                logger.error(f"[EmergencyAlertarr] EAS scheduled test failed for ch {cid}: {e}", exc_info=True)
+        if fired:
+            _save_mappings(mappings)
 
-    fired = 0
-    now_utc = datetime.now(_tz.utc)
-    for cid, mapping in list(mappings.items()):
-        if not (mapping.get("type") == "eas" or mapping.get("eas_armed")):
-            continue
-        if mapping.get("eas_profile_id") or mapping.get("eas_restore_at"):
-            continue  # already mid-alert
-        if cid not in streaming_ids:
-            continue  # nobody watching this one
-        if not mapping.get("original_profile_id"):
-            continue
-        channel = Channel.objects.filter(id=int(cid)).first()
-        if not channel:
-            continue
-        orig = StreamProfile.objects.filter(id=mapping.get("original_profile_id")).first()
-        if not orig:
-            continue
-        fake_alerts = [_eas_build_test_alert(mode, now_utc, area=test_area)]
-        try:
-            _ep_font, _ep_scale = _easyplus_settings(settings)
-            _lead_in = float(settings.get("eas_lead_in_secs") or 0)
-            eas_profile, _, seq_duration = _clone_and_inject_eas(
-                channel.id, orig, channel.name, silence_secs, transcode_mode,
-                style=overlay_style, unique_alerts=fake_alerts, use_tts=use_tts,
-                endec_test=endec_test, tail_secs=tail_secs,
-                generate_tones=generate_tones, att_secs=att_secs,
-                easyplus_font=_ep_font, easyplus_scale=_ep_scale,
-                lead_in_secs=_lead_in,
-            )
-            _assign_profile(channel, eas_profile)
-            fake_alerts[0]["expires"] = (now_utc + timedelta(seconds=seq_duration)).isoformat()
-            _eas_write_alert(cid, fake_alerts, style=overlay_style)
-            mapping["eas_profile_id"] = eas_profile.id
-            _eas_arm_restore(mapping, seq_duration, time.time())
-            mappings[cid] = mapping
-            if rc:
-                try:
-                    raw_st = rc.get(_EAS_STATE_KEY)
-                    st = json.loads(raw_st) if raw_st else {}
-                    st[cid] = "__test__"
-                    rc.setex(_EAS_STATE_KEY, 3600, json.dumps(st))
-                except Exception:
-                    pass
-            _restart_channel_stream_async(channel, label="EAS", proactive=True)
-            fired += 1
-            _eas_history_add(
-                fake_alerts[0].get("event"), fake_alerts[0].get("area"),
-                channel.name, kind="test",
-            )
-        except Exception as e:
-            logger.error(f"[EmergencyAlertarr] EAS scheduled test failed for ch {cid}: {e}", exc_info=True)
-
-    if fired:
-        _save_mappings(mappings)
     label = "Required Weekly Test" if mode == "weekly" else "Required Monthly Test"
-    logger.info(f"[EmergencyAlertarr] EAS {label}: fired on {fired} channel(s)")
-    return fired
+    if fired:
+        _eas_history_add(label, test_area or "this viewing area", fired, kind="test")
+    logger.info(f"[EmergencyAlertarr] EAS {label}: fired on {len(fired)} channel(s)")
+    return len(fired)
 
 def _eas_scheduler_loop(stop_event):
     """Background loop that checks once a minute whether a scheduled RWT/RMT is
@@ -2294,12 +3663,12 @@ def _eas_scheduler_loop(stop_event):
     while not stop_event.is_set():
         try:
             settings = _get_settings()
-            if (settings.get("eas_test_schedule") or "off").lower() in ("weekly", "monthly"):
+            if (settings.get("eas_test_schedule") or "off").lower() in ("weekly", "monthly", "realistic"):
                 from datetime import datetime
                 # Local time per the OS/container timezone.
                 now_local = datetime.now()
                 rc = _get_redis_client()
-                last_key = None
+                last_key = _eas_sched_mem.get("last")
                 if rc:
                     try:
                         last_key = rc.get(_EAS_SCHED_KEY)
@@ -2307,17 +3676,22 @@ def _eas_scheduler_loop(stop_event):
                             last_key = last_key.decode()
                     except Exception:
                         pass
-                window_key = _eas_scheduled_test_due(settings, now_local, last_key)
+                due = _eas_scheduled_test_due(settings, now_local, last_key)
+                kind = None
+                if isinstance(due, tuple):
+                    due, kind = due
+                window_key = due
                 if window_key:
                     # Only one worker fires the scheduled test.
                     if not rc or rc.set(_EAS_SCHED_LOCK, "1", nx=True, ex=300):
+                        _eas_sched_mem["last"] = window_key
                         if rc:
                             try:
                                 rc.set(_EAS_SCHED_KEY, window_key)
                             except Exception:
                                 pass
                         logger.info(f"[EmergencyAlertarr] EAS scheduled test window reached: {window_key}")
-                        _eas_fire_scheduled_test()
+                        _eas_fire_scheduled_test(kind)
         except Exception as e:
             logger.error(f"[EmergencyAlertarr] EAS scheduler error: {e}", exc_info=True)
         finally:
@@ -2329,14 +3703,13 @@ def _eas_scheduler_loop(stop_event):
         stop_event.wait(timeout=60)
 
 def _save_mappings(mappings):
-    global _uuid_map_cache
     try:
         os.makedirs(_DATA_DIR, exist_ok=True)
-        tmp = MAPPINGS_FILE + ".tmp"
+        tmp = f"{MAPPINGS_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(mappings, f, indent=2)
         os.replace(tmp, MAPPINGS_FILE)
-        _uuid_map_cache = {"map": {}, "fetched_at": 0}  # force refresh on next scan
+        # (the uuid map refreshes itself when the set of mapped channels changes)
     except Exception as e:
         logger.error(f"emergencyalertarr: failed to save mappings: {e}")
 
@@ -2422,10 +3795,14 @@ def _redis_lock_acquire_or_refresh(rc, key, ttl):
 
 def _get_uuid_to_id_map(mappings):
     """Returns {uuid_str: int_channel_id} for all currently mapped channels.
-    Cached for UUID_MAP_TTL seconds to avoid hitting the DB on every 2s tick."""
+    Cached; refreshed every UUID_MAP_TTL seconds or when the set of mapped
+    channels changes (not on every mappings save -- with every channel armed
+    that reloaded thousands of channels on each alert step)."""
     global _uuid_map_cache
     now = time.time()
-    if now - _uuid_map_cache["fetched_at"] < UUID_MAP_TTL and _uuid_map_cache["map"]:
+    keyset = frozenset(str(k) for k in mappings.keys())
+    if (now - _uuid_map_cache["fetched_at"] < UUID_MAP_TTL and _uuid_map_cache["map"]
+            and _uuid_map_cache.get("ids") == keyset):
         return _uuid_map_cache["map"]
     try:
         from apps.channels.models import Channel
@@ -2440,7 +3817,7 @@ def _get_uuid_to_id_map(mappings):
             uuid_val = getattr(ch, "uuid", None)
             if uuid_val:
                 result[str(uuid_val).lower()] = ch.id
-        _uuid_map_cache = {"map": result, "fetched_at": now}
+        _uuid_map_cache = {"map": result, "fetched_at": now, "ids": keyset}
         logger.debug(f"emergencyalertarr: uuid map refreshed — {len(result)} entries")
         return result
     except Exception as e:
@@ -2486,192 +3863,236 @@ def _redis_scan_active():
         return None
     return active
 
+_EAS_MONITOR_LOCK = f"emergencyalertarr:{_PLUGIN_KEY}:eas_monitor_lock"
+
+_EAS_MONITOR_NEW  = f"emergencyalertarr:{_PLUGIN_KEY}:eas_monitor_new"
+
+_EAS_MONITOR_SR = 22050
+
+def _eas_monitor_area_ok(alert, settings):
+    """A decoded header is relayed only if it is for our area (an ENDEC's
+    location filter). National codes always pass. With no county codes
+    configured, everything the monitored station airs is accepted."""
+    if settings.get("eas_national_test"):
+        return True
+    from eaa_fips import zones_to_same
+    from eaa_fips import state_postal_to_fips
+    codes = [c for c in (settings.get("eas_ipaws_same_codes") or "").replace(" ", "").split(",")
+             if c.isdigit() and len(c) == 6]
+    zones = [z.strip().upper() for z in (settings.get("eas_zones") or "").split(",") if z.strip()]
+    codes += zones_to_same(zones)
+    if not codes:
+        # Forecast zones only (TXZ119): accept the zones' whole states.
+        for z in zones:
+            ss = state_postal_to_fips(z[:2]) if len(z) == 6 else None
+            if ss and "0" + ss + "000" not in codes:
+                codes.append("0" + ss + "000")
+    if not codes:
+        return True
+    ac = alert.get("same_codes") or []
+    if any(str(c).endswith("00000") for c in ac) or _is_national_alert(alert):
+        return True
+    return _same_codes_match(ac, codes)
+
+def _eas_monitor_alerts(rc, settings):
+    """Alerts decoded from the monitored channel that are still valid."""
+    if not _eas_chan(settings, "eas_monitor_channel"):
+        return []
+    items = _eas_json_get(rc, _EAS_MONITOR_KEY, [])
+    out = []
+    now = time.time()
+    from datetime import datetime
+    for a in items:
+        try:
+            exp = datetime.fromisoformat((a.get("expires") or "").replace("Z", "+00:00")).timestamp()
+        except Exception:
+            exp = float(a.get("received") or 0) + 3600
+        if exp > now:
+            out.append(a)
+    return out
+
+def _eas_monitor_push(rc, alert):
+    items = _eas_json_get(rc, _EAS_MONITOR_KEY, [])
+    items = [a for a in items if a.get("id") != alert.get("id")][-40:]
+    items.append(alert)
+    _eas_json_set(rc, _EAS_MONITOR_KEY, items, 12 * 3600)
+    if rc:
+        try:
+            rc.setex(_EAS_MONITOR_NEW, 600, "1")
+        except Exception:
+            pass
+
+def _eas_monitor_new_pop(rc):
+    if not rc:
+        return False
+    try:
+        return bool(rc.delete(_EAS_MONITOR_NEW))
+    except Exception:
+        return False
+
+def _eas_monitor_loop(stop_event):
+    """Listen to one Dispatcharr channel's audio for EAS tones, like an
+    ENDEC's monitoring assignment (LP-1/LP-2). Decoded messages (header +
+    the recorded audio message) are handed to the sweep, which applies the
+    same filters, duplicate check and priority as feed alerts. The channel is
+    pulled through Dispatcharr's own proxy, so it uses one upstream
+    connection, shared with anyone watching it."""
+    import select
+    import uuid as _uuid
+    token = _uuid.uuid4().hex
+    proc = None
+    cur = None
+    dec = None
+    status_t = 0.0
+    fail = 0
+    stats = {"since": 0.0, "headers": 0, "last": ""}
+
+    def _stop():
+        nonlocal proc
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+        proc = None
+
+    while not stop_event.is_set():
+        try:
+            settings = _get_settings()
+            chid = _eas_chan(settings, "eas_monitor_channel")
+            try:
+                from django.db import connection
+                connection.close()
+            except Exception:
+                pass
+            if not chid:
+                _stop()
+                cur = None
+                stop_event.wait(timeout=15)
+                continue
+            rc = _get_redis_client()
+            owner = True
+            if rc:
+                try:
+                    if rc.set(_EAS_MONITOR_LOCK, token, nx=True, ex=40):
+                        owner = True
+                    else:
+                        v = rc.get(_EAS_MONITOR_LOCK)
+                        v = v.decode() if isinstance(v, bytes) else v
+                        owner = (v == token)
+                        if owner:
+                            rc.expire(_EAS_MONITOR_LOCK, 40)
+                except Exception:
+                    owner = True
+            if not owner:
+                _stop()
+                stop_event.wait(timeout=20)
+                continue
+            if proc is None or chid != cur:
+                _stop()
+                from apps.channels.models import Channel
+                from eaa_forcetune import dispatcharr_base_urls
+                from eaa_same import SameDecoder
+                ch = Channel.objects.filter(id=int(chid)).first()
+                if not ch:
+                    stop_event.wait(timeout=30)
+                    continue
+                base = dispatcharr_base_urls(settings.get("eas_dispatcharr_url") or "")[fail % 3]
+                url = f"{base}/proxy/ts/stream/{ch.uuid}"
+                ff = shutil.which("ffmpeg") or "ffmpeg"
+                proc = subprocess.Popen(
+                    [ff, "-hide_banner", "-v", "error", "-nostdin", "-user_agent",
+                     "EmergencyAlertarr/monitor", "-rw_timeout", "15000000", "-i", url,
+                     "-vn", "-sn", "-dn", "-ac", "1", "-ar", str(_EAS_MONITOR_SR), "-f", "s16le", "pipe:1"],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                cur = chid
+                _ensure_dirs()
+                dec = SameDecoder(_EAS_MONITOR_SR, workdir=os.path.join(RUNTIME_DIR, "monitor"))
+                stats.update({"since": time.time(), "channel": ch.name, "url": base})
+                logger.info(f"[EmergencyAlertarr] monitor: listening to '{ch.name}' for EAS tones")
+            # read ~0.5 s of audio
+            r, _, _ = select.select([proc.stdout], [], [], 5.0)
+            data = proc.stdout.read(_EAS_MONITOR_SR) if r else b""
+            if not data:
+                if proc.poll() is not None:
+                    fail += 1
+                    logger.warning(f"[EmergencyAlertarr] monitor: stream ended -- reconnecting "
+                                   f"in {min(60, 5 * fail)}s")
+                    _stop()
+                    stop_event.wait(timeout=min(60, 5 * fail))
+                continue
+            fail = 0
+            import numpy as np
+            x = np.frombuffer(data[: len(data) // 2 * 2], dtype="<i2").astype(np.float64) / 32768.0
+            for ev in dec.feed(x):
+                from eaa_same import header_to_alert
+                from eaa_fips import describe_codes
+                from eaa_styles import SAME_EVENT_NAMES
+                ean = "-EAN-" in (ev.get("text") or "")
+                if ev["type"] == "header":
+                    stats["headers"] += 1
+                    stats["last"] = ev["text"]
+                    logger.info(f"[EmergencyAlertarr] monitor: EAS header received: {ev['text']}")
+                    if ean:
+                        # A national alert is relayed live, at the header -- it
+                        # ends when the station sends its EOM.
+                        a = header_to_alert(ev["text"], ev["time"], event_names=SAME_EVENT_NAMES,
+                                            describe=describe_codes,
+                                            channel_name=stats.get("channel", ""))
+                        if a:
+                            _eas_monitor_push(rc, a)
+                elif ev["type"] == "message":
+                    a = header_to_alert(ev["text"], ev["time"], event_names=SAME_EVENT_NAMES,
+                                        describe=describe_codes, audio_file=ev.get("audio"),
+                                        channel_name=stats.get("channel", ""))
+                    if not a:
+                        continue
+                    if ean:
+                        # EOM for the national alert: drop it from the monitor
+                        # list so the sweep sees it as over and sends the EOM.
+                        items = [x for x in _eas_json_get(rc, _EAS_MONITOR_KEY, []) if x.get("id") != a["id"]]
+                        _eas_json_set(rc, _EAS_MONITOR_KEY, items, 12 * 3600)
+                        if rc:
+                            try:
+                                rc.setex(_EAS_MONITOR_NEW, 600, "1")
+                            except Exception:
+                                pass
+                        logger.info("[EmergencyAlertarr] monitor: national alert ended (EOM received)")
+                        continue
+                    if not _eas_monitor_area_ok(a, settings):
+                        logger.info(f"[EmergencyAlertarr] monitor: {a['event']} is not for this area -- ignored")
+                        continue
+                    _eas_monitor_push(rc, a)
+                    logger.info(f"[EmergencyAlertarr] monitor: {a['event']} received "
+                                f"({'with' if ev.get('audio') else 'no'} audio, "
+                                f"{'EOM' if ev.get('eom') else 'no EOM / reset'})")
+            if time.time() - status_t > 30:
+                status_t = time.time()
+                _eas_json_set(rc, _EAS_MONITOR_STATUS_KEY, dict(stats, ts=status_t), 300)
+        except Exception as e:
+            logger.error(f"[EmergencyAlertarr] monitor error: {e}", exc_info=True)
+            _stop()
+            stop_event.wait(timeout=30)
+    _stop()
+
 def _poll_loop(stop_event):
     # EAS sweep -- NWS alert polling, interval configurable (default 60s)
     eas_t = threading.Thread(target=_eas_sweep_loop, args=(stop_event,), daemon=True)
     eas_t.start()
+    # Channel monitor -- listens to one channel's audio for EAS tones
+    mon_t = threading.Thread(target=_eas_monitor_loop, args=(stop_event,), daemon=True)
+    mon_t.start()
     # RWT/RMT scheduler -- fires a Required Weekly/Monthly Test on schedule
     sched_t = threading.Thread(target=_eas_scheduler_loop, args=(stop_event,), daemon=True)
     sched_t.start()
     eas_t.join()
     sched_t.join()
 
-# --- SAME stream monitor (live PEP/LP input) + decoded-alert relay ----------
-_stream_monitor = {"mon": None, "url": None}
-
-
-def _eas_area_match_decoded(alert, settings):
-    """True if a decoded SAME alert should relay here: national, or its FIPS codes
-    match the monitored codes (falls back to the IPAWS codes; ALL/unset relays
-    everything heard, since the monitored station is already area-specific)."""
-    try:
-        from eaa_sources import _same_codes_match, _is_national_alert
-    except Exception:
-        return True
-    if _is_national_alert(alert):
-        return True
-    raw = (settings.get("eas_monitor_codes") or settings.get("eas_ipaws_same_codes") or "").strip()
-    if not raw or raw.upper() == "ALL":
-        return True
-    codes = [c.strip() for c in raw.replace(" ", "").split(",") if c.strip()]
-    return _same_codes_match(alert.get("same_codes") or [], codes)
-
-
-def _eas_relay_decoded(info):
-    """Relay a SAME activation decoded off the monitored stream: air it on watched
-    armed channels with the captured message spliced between a regenerated
-    header/attention and EOM -- like a real ENDEC forwarding a received alert."""
-    settings = _get_settings()
-    alert = info.get("alert")
-    if not alert:
-        return
-    if not _eas_area_match_decoded(alert, settings):
-        logger.info(f"[EmergencyAlertarr] relay: {alert.get('event')} not for our area -- ignoring")
-        return
-    from apps.channels.models import Channel
-    from core.models import StreamProfile
-    mappings = _get_mappings()
-    streaming_ids = _eas_streaming_ids()
-    overlay_style  = (settings.get("eas_overlay_style") or "easyplus").lower()
-    transcode_mode = settings.get("eas_transcode_mode") or "full"
-    try:
-        att_secs = max(4.0, min(30.0, float(settings.get("eas_att_secs") or 8)))
-    except Exception:
-        att_secs = 8.0
-    lead_in = float(settings.get("eas_lead_in_secs") or 0)
-    _ep_font, _ep_scale = _easyplus_settings(settings)
-    msg_wav  = info.get("message_wav")
-    msg_secs = info.get("msg_secs") or 0.0
-    now_ts = time.time()
-    fired = []
-    for cid, mapping in list(mappings.items()):
-        if not mapping or (mapping.get("type") != "eas" and not mapping.get("eas_armed")):
-            continue
-        if cid not in streaming_ids or mapping.get("eas_profile_id"):
-            continue
-        if not mapping.get("original_profile_id"):
-            continue
-        orig = StreamProfile.objects.filter(id=mapping.get("original_profile_id")).first()
-        channel = Channel.objects.filter(id=int(cid)).first()
-        if not orig or not channel:
-            continue
-        try:
-            eas_profile, _, seq = _clone_and_inject_eas(
-                channel.id, orig, channel.name, transcode_mode=transcode_mode,
-                style=overlay_style, unique_alerts=[alert], use_tts=False,
-                generate_tones=True, att_secs=att_secs,
-                easyplus_font=_ep_font, easyplus_scale=_ep_scale, lead_in_secs=lead_in,
-                relay_message_wav=msg_wav, relay_message_secs=msg_secs,
-            )
-            _assign_profile(channel, eas_profile)
-            _eas_write_alert(cid, [alert], style=overlay_style)
-            mapping["eas_profile_id"] = eas_profile.id
-            _eas_arm_restore(mapping, seq, now_ts)
-            mappings[cid] = mapping
-            _restart_channel_stream_async(channel, label="EAS-relay", proactive=True)
-            with _eas_lock:
-                _eas_active[cid] = alert.get("event") or "EAS"
-            fired.append(channel.name)
-        except Exception as e:
-            logger.error(f"[EmergencyAlertarr] relay fire failed ch {cid}: {e}", exc_info=True)
-    if fired:
-        _save_mappings(mappings)
-        _eas_history_add(alert.get("event") or "Relay", alert.get("area") or "",
-                         fired, kind="alert", severity=alert.get("severity") or "")
-        _eas_log_event("RELAYED", event=alert.get("event") or "", severity=alert.get("severity") or "",
-                       area=alert.get("area") or "", channels=", ".join(fired),
-                       note=f"SAME relay: {info.get('header','')[:48]}")
-        _eas_notify("fire", f"\U0001F4E1 EAS relay: {alert.get('event')}"
-                    + (f" — on {', '.join(fired)}"))
-        logger.info(f"[EmergencyAlertarr] relayed {alert.get('event')} on {', '.join(fired)}")
-    else:
-        logger.info("[EmergencyAlertarr] relay: no watched armed channels to air on")
-
-
-def _eas_on_activation(info):
-    """StreamMonitor callback (runs in the monitor thread)."""
-    try:
-        from django.db import close_old_connections
-        close_old_connections()
-    except Exception:
-        pass
-    try:
-        _eas_relay_decoded(info)
-    except Exception as e:
-        logger.error(f"[EmergencyAlertarr] relay callback error: {e}", exc_info=True)
-
-
-_MONITOR_LEASE_KEY = "emergencyalertarr:monitor_owner"
-_MONITOR_LEASE_TTL = 150   # seconds; must exceed the poll interval
-
-
-def _eas_ensure_monitor(settings):
-    """Start/stop the live SAME stream monitor to match settings. Exactly one
-    worker runs it, guarded by an atomic Redis lease. Fails CLOSED: if we can't
-    prove we hold the lease (no Redis, an error, or another worker owns it), we
-    do NOT start -- so a Redis hiccup during worker autoscaling can't spawn a
-    stampede of ffmpeg pulls."""
-    url = (settings.get("eas_monitor_url") or "").strip()
-    enabled = str(settings.get("eas_monitor_enabled")).strip().lower() in ("true", "1", "yes", "on")
-    rc = _get_redis_client()
-    me = str(os.getpid())
-    want = enabled and bool(url)
-
-    own = False
-    if want and rc:
-        try:
-            if rc.set(_MONITOR_LEASE_KEY, me, nx=True, ex=_MONITOR_LEASE_TTL):
-                own = True                      # acquired a free lease
-            else:
-                cur = rc.get(_MONITOR_LEASE_KEY)
-                cur = cur.decode() if isinstance(cur, bytes) else cur
-                if cur == me:
-                    rc.set(_MONITOR_LEASE_KEY, me, ex=_MONITOR_LEASE_TTL)  # refresh our lease
-                    own = True
-        except Exception:
-            own = False                          # fail closed
-
-    cur_mon = _stream_monitor["mon"]
-    if want and own:
-        if cur_mon is None or _stream_monitor["url"] != url:
-            if cur_mon is not None:
-                try:
-                    cur_mon.stop()
-                except Exception:
-                    pass
-            try:
-                from eaa_decoder import StreamMonitor
-                mon = StreamMonitor(url, _eas_on_activation,
-                                    out_dir=os.path.join(_DATA_DIR, "captures"), logger=logger)
-                mon.start()
-                _stream_monitor["mon"] = mon
-                _stream_monitor["url"] = url
-                logger.info(f"[EmergencyAlertarr] SAME stream monitor started (owner pid {me}): {url}")
-            except Exception as e:
-                logger.error(f"[EmergencyAlertarr] could not start stream monitor: {e}", exc_info=True)
-    else:
-        if cur_mon is not None:
-            try:
-                cur_mon.stop()
-            except Exception:
-                pass
-            _stream_monitor["mon"] = None
-            _stream_monitor["url"] = None
-            # release our lease so another worker can take over promptly
-            if rc:
-                try:
-                    cur = rc.get(_MONITOR_LEASE_KEY)
-                    cur = cur.decode() if isinstance(cur, bytes) else cur
-                    if cur == me:
-                        rc.delete(_MONITOR_LEASE_KEY)
-                except Exception:
-                    pass
-            logger.info("[EmergencyAlertarr] SAME stream monitor stopped")
-        elif want and not rc:
-            # No Redis -> can't guarantee a single owner, so we don't start.
-            logger.warning("[EmergencyAlertarr] stream monitor needs Redis to guarantee a single "
-                           "owner across workers; not starting.")
-
+_EAS_LOCKED_ACTIONS = {
+    "enable_eas", "disable_eas", "test_eas", "inject_alert", "migrate_eas",
+    "clean_orphans", "reset_all_eas", "stop_alerts",
+}
 
 class Plugin:
     @property
@@ -2708,190 +4129,357 @@ class Plugin:
         except Exception:
             groups = []
             channels = []
+        # Channel picker (number · name, every channel), for the details and
+        # monitored channel.
+        try:
+            from apps.channels.models import Channel
+            def _num_label(c):
+                n = getattr(c, "channel_number", None)
+                try:
+                    n = (str(int(n)) if float(n).is_integer() else str(n)) if n is not None else ""
+                except Exception:
+                    n = str(n or "")
+                name = c.name or f"Channel {c.id}"
+                return f"{n} · {name}" if n else name
+            def _sort_key(c):
+                n = getattr(c, "channel_number", None)
+                try:
+                    return (0, float(n), c.name or "")
+                except Exception:
+                    return (1, 0.0, c.name or "")
+            channel_picker = [{"value": str(c.id), "label": _num_label(c)}
+                              for c in sorted(Channel.objects.all(), key=_sort_key)]
+        except Exception:
+            channel_picker = [{"value": c["value"], "label": c["label"]} for c in channels]
 
         try:
             mappings = _get_mappings()
         except Exception:
             mappings = {}
 
-        ticker_lines = []
-        for cid, m in mappings.items():
-            name = m.get("channel_name", f"Channel {cid}")
-            ticker_type = m.get("type", "eas")
-            if ticker_type == "eas":
-                event = _eas_active.get(cid)
-                now_playing = f"[EAS] ALERT: {event}" if event else "[EAS] monitoring"
+        # ---- Status line -------------------------------------------------
+        armed = [(cid, m) for cid, m in mappings.items()
+                 if isinstance(m, dict) and (m.get("type") == "eas" or m.get("eas_armed"))]
+        playing = [m.get("channel_name", f"Channel {cid}") + f" — {_eas_active.get(cid)}"
+                   for cid, m in armed if _eas_active.get(cid)]
+        try:
+            tts_ok = tts_available(_eas_tts_opts(_get_settings()))
+        except Exception:
+            tts_ok = False
+        if armed:
+            status = f"{len(armed)} channel(s) armed for EAS."
+            if playing:
+                status += " Alert on screen: " + "; ".join(playing) + "."
             else:
-                now_playing = f"[{ticker_type}]"
-            ticker_lines.append(f"- {name}: {now_playing}")
+                status += " No alert playing right now."
+        else:
+            status = "No channels armed yet — pick channels in section 1 and press \"Enable EAS\"."
+        status += " Spoken readout: " + ("ready." if tts_ok else "no TTS engine found (alerts use silence).")
 
-        active_label = (f"{len(mappings)} monitored channel(s):\n" + "\n".join(ticker_lines)) if mappings else "No channels are being monitored."
+        def section(n, title, text=None):
+            f = {"id": f"_sec_{n}", "type": "info", "label": f"{n} · {title}"}
+            if text:
+                f["help_text"] = text
+            return f
+
+        def note(i, text):
+            return {"id": f"_note_{i}", "type": "info", "label": "", "help_text": text}
 
         return [
-            # Overview
-            {"id": "_eas_section",  "type": "info", "label": "══════════  EMERGENCY ALERT SYSTEM  ══════════"},
-            {"id": "_eas_about",    "type": "info",
-             "label": "Turns your channels into an EAS relay. EmergencyAlertarr watches live alerts from the National Weather Service and/or FEMA IPAWS for your area; when one fires, the channel being watched takes over with a broadcast-style alert screen, real EAS tones, and (optionally) a spoken readout, then returns to normal programming when it clears. Alerts play one at a time. Everything is generated on the fly — no WAV files or extra downloads required."},
+            # ── Overview ─────────────────────────────────────────────────
+            {"id": "_eas_title", "type": "info", "label": "EmergencyAlertarr — EAS for your channels",
+             "help_text": "Watches NWS / FEMA IPAWS alerts for your area. When one is issued, whoever is "
+                          "watching an armed channel gets a real-looking EAS screen with SAME tones and a "
+                          "spoken readout, then the channel goes back to normal. Quick start: 1) choose "
+                          "channels, 2) enter your area, 3) press \"Enable EAS\", 4) press \"Test EAS Alert\"."},
+            {"id": "_eas_status", "type": "info", "label": "Status", "help_text": status},
 
-            # 1 - Alert sources
-            {"id": "_eas_src_header", "type": "info", "label": "──────  1 · ALERT SOURCES  ──────"},
-            {"id": "_eas_source_note", "type": "info",
-             "label": "Where alerts come from. NWS (api.weather.gov) is weather-only, filtered by NWS zone/county codes. IPAWS (FEMA) is the national feed — it adds AMBER, civil, and law-enforcement alerts, filtered by SAME/FIPS county codes. 'Both' merges them and de-duplicates an alert that arrives from each. You must fill in the code field for whichever source(s) you turn on."},
-            {"id": "eas_source", "type": "select", "label": "Alert Source",
-             "options": [
-                 {"value": "nws",   "label": "NWS only (weather.gov)"},
-                 {"value": "ipaws", "label": "IPAWS only (FEMA / national)"},
-                 {"value": "both",  "label": "Both (NWS + IPAWS)"},
-             ]},
-            {"id": "_eas_zone_help", "type": "info",
-             "label": "NWS codes: find yours at weather.gov — pick your state, then your county; the code (e.g. TXC113) shows in the URL. Separate multiple with commas. Type ALL by itself to monitor every US alert (handy for testing — there's almost always something active). Required when Alert Source is NWS or Both."},
-            {"id": "eas_zones",     "type": "text",   "label": "NWS Zone / County Codes",
-             "placeholder": "e.g. TXC113,TXC121 — or ALL"},
-            {"id": "_eas_ipaws_note", "type": "info",
-             "label": "IPAWS codes: 6-digit SAME/FIPS county codes (e.g. Tulsa County OK = 040143). A whole state uses a trailing 000 (040000 = all Oklahoma). Type ALL by itself to take every IPAWS alert nationwide (testing). National alerts — EAN, National Periodic Test (NPT), and Primary Entry Point (PEP) activations — always come through regardless of the codes you set. Required when Alert Source is IPAWS or Both."},
-            {"id": "eas_ipaws_same_codes", "type": "text", "label": "IPAWS County Codes (6-digit SAME/FIPS, or ALL)",
-             "placeholder": "e.g. 040143,040131 — or 040000, or ALL"},
-            {"id": "eas_ipaws_feeds", "type": "text", "label": "IPAWS Feeds (advanced — comma-separated: eas, wea, public)",
-             "placeholder": "eas"},
-            {"id": "eas_severity_filter", "type": "select", "label": "Minimum Severity to trigger",
-             "options": [
-                 {"value": "Moderate", "label": "Watches and up (Moderate+)"},
-                 {"value": "Severe",   "label": "Warnings and up (Severe+)"},
-                 {"value": "Extreme",  "label": "Emergencies only (Extreme)"},
-             ]},
-            {"id": "_eas_onlyreal_note", "type": "info",
-             "label": "EAS-only filter (recommended, especially with ALL zones): NWS sends many products that a real EAS encoder never relays — heat advisories, air-quality alerts, etc. Turn this on to fire only on products that would actually hit EAS: it drops alerts the NWS marks as blocked from EAS and alerts with no real SAME event code. National alerts (EAN/NPT/PEP) always pass. Optionally restrict further with allow/block event-code lists below (3-letter SAME codes like TOR, SVR, FFW)."},
-            {"id": "eas_only_real", "type": "boolean", "label": "Only fire on real EAS products (skip heat/air-quality/etc.)"},
-            {"id": "eas_event_allow", "type": "text", "label": "Only these event codes (optional allow-list, e.g. TOR,SVR,FFW)", "placeholder": "blank = allow all EAS events"},
-            {"id": "eas_event_block", "type": "text", "label": "Never these event codes (optional block-list)", "placeholder": "e.g. SVR,SPS"},
-            {"id": "eas_poll_interval",   "type": "number", "label": "How often to check for alerts (seconds, min 15, default 60)", "min": 15},
+            # ── 1 · Channels ─────────────────────────────────────────────
+            section(1, "CHANNELS",
+                    "Which channels get alerts. Armed channels play normally and only switch over while "
+                    "an alert is playing. After changing this, press \"Enable EAS\" (or \"Disable EAS\")."),
+            {"id": "eas_target_type", "type": "select", "label": "Apply to", "default": "channel",
+             "options": [{"value": "all",     "label": "All channels"},
+                         {"value": "group",   "label": "One channel group"},
+                         {"value": "groups",  "label": "Several channel groups"},
+                         {"value": "channel", "label": "One channel"}]},
+            {"id": "eas_channel_id", "type": "select", "label": "Channel",
+             "help_text": "Used when 'Apply to' is One channel.", "options": channels},
+            {"id": "eas_channel_group_id", "type": "select", "label": "Channel group",
+             "help_text": "Used when 'Apply to' is One channel group.", "options": groups},
+            {"id": "eas_channel_group_names", "type": "string", "label": "Channel groups",
+             "help_text": "Used when 'Apply to' is Several channel groups. Comma-separated names.",
+             "placeholder": "News, Locals, Networks"},
+            {"id": "eas_exclude_groups", "type": "string", "label": "Skip these groups (optional)",
+             "help_text": "Comma-separated group names that never get alerts.", "placeholder": "Music, Radio"},
 
-            # 1b - Monitored input (live SAME decode)
-            {"id": "_eas_monitor_header", "type": "info", "label": "──────  MONITORED INPUT (SAME decode)  ──────"},
-            {"id": "_eas_monitor_note", "type": "info",
-             "label": "Monitor a live audio stream (your PEP/LP station's web stream) like a real ENDEC: it decodes the SAME header off the audio, captures the message, and relays the alert on your watched channels with the real received audio (regenerated header/attention + captured message + regenerated EOM). Paste a direct stream URL (Icecast/HLS/etc. that ffmpeg can open). Runs on one worker; test with recorded activations first using the eaa_decoder.py CLI."},
-            {"id": "eas_monitor_enabled", "type": "boolean", "label": "Monitor a live stream for SAME activations"},
-            {"id": "eas_monitor_url", "type": "text", "label": "Monitored stream URL (PEP/LP station audio)", "placeholder": "https://example.com/stream.mp3"},
-            {"id": "eas_monitor_codes", "type": "text", "label": "Relay only these SAME codes (optional; blank = relay everything heard). National always relays.", "placeholder": "e.g. 040143,040131"},
+            # ── 2 · Your area ────────────────────────────────────────────
+            section(2, "YOUR AREA",
+                    "Where alerts come from and which ones count as yours. National alerts (presidential "
+                    "message, nationwide test) always come through."),
+            {"id": "eas_national_test", "type": "boolean", "label": "National test mode (receive every US alert)",
+             "default": False,
+             "help_text": "For testing: overrides everything below -- NWS + IPAWS, the whole country, every "
+                          "severity. Alerts already active when you switch it on are skipped; new ones play, "
+                          "at least 5 minutes apart. Turn it off to go back to your area."},
+            {"id": "eas_source", "type": "select", "label": "Alert source", "default": "nws",
+             "help_text": "NWS = weather alerts from api.weather.gov. IPAWS = FEMA's national feed "
+                          "(adds AMBER, civil and law-enforcement alerts). Both = merged, duplicates removed.",
+             "options": [{"value": "nws",   "label": "NWS (weather)"},
+                         {"value": "ipaws", "label": "IPAWS (FEMA — weather + civil + AMBER)"},
+                         {"value": "both",  "label": "Both"}]},
+            {"id": "eas_zones", "type": "string", "label": "NWS county / zone codes",
+             "help_text": "For NWS or Both. Your county code is in the URL on weather.gov (e.g. TXC113 "
+                          "= Dallas County, TX). Comma-separated. ALL = every US alert (for testing).",
+             "placeholder": "TXC113, TXC121"},
+            {"id": "eas_ipaws_same_codes", "type": "string", "label": "IPAWS county codes (6-digit SAME)",
+             "help_text": "For IPAWS or Both. 0 + state + county FIPS, e.g. 048113 = Dallas County TX. "
+                          "048000 = all of Texas. ALL = every alert nationwide (for testing).",
+             "placeholder": "048113, 048121"},
+            {"id": "eas_severity_filter", "type": "select", "label": "Which alerts", "default": "Moderate",
+             "help_text": "Life-safety alerts (tornado, flash flood, AMBER, civil emergency, evacuation…) "
+                          "always play for your area, whatever you pick here.",
+             "options": [{"value": "Moderate", "label": "Watches and warnings"},
+                         {"value": "Severe",   "label": "Warnings only"},
+                         {"value": "Extreme",  "label": "Only the most extreme"}]},
 
-            # 2 - On-screen look
-            {"id": "_eas_ovl_header", "type": "info", "label": "──────  2 · ON-SCREEN LOOK  ──────"},
-            {"id": "_eas_overlay_style_note", "type": "info",
-             "label": "How the alert appears. Full-screen takeovers replace the channel: EASyPlus = classic broadcast EAS generator (black, centered white text, scrolling line); DASDEC = cable-headend look (navy, red border, centered monospace, paginated). Crawl styles keep the live program visible with just a bar on top: EASyPlus Ticker = black bar, white scrolling text (Trilithic EASy CGEN ticker); DASDEC Scroll = gray two-row bar, 'Emergency Alert Message' label over the scrolling details (Cox/Spectrum style). All still play the EAS tones."},
-            {"id": "eas_overlay_style", "type": "select", "label": "Alert Overlay Style",
-             "options": [
-                 {"value": "easyplus",        "label": "EASyPlus — full-screen broadcast EAS takeover"},
-                 {"value": "dasdec",          "label": "DASDEC — full-screen cable-headend takeover (navy/red, paginated)"},
-                 {"value": "easyplus_ticker", "label": "EASyPlus Ticker — crawl only (black bar, over live video)"},
-                 {"value": "dasdec_scroll",   "label": "DASDEC Scroll — gray 2-row banner crawl (Cox/Spectrum, over live video)"},
-             ]},
-            {"id": "_eas_epfont_note", "type": "info",
-             "label": "Font (optional override): EASyPlus uses the bundled fonts/EASyText.ttf and DASDEC uses fonts/luximb.ttf. To override, drop a .ttf/.otf into the plugin fonts/ folder and put its filename here (an absolute path or system-font name also works). Leave blank to use the bundled font; a name that can't be found falls back to it."},
-            {"id": "eas_easyplus_font", "type": "text", "label": "Overlay Font (filename, path, or system font name)", "placeholder": "e.g. my_eas_font.ttf"},
-            {"id": "eas_easyplus_font_scale", "type": "number", "label": "Overlay Text Size (1.0 = default; 1.2–1.5 is bigger, up to 3.0)", "min": 0.5, "max": 3},
+            # ── 3 · Alert screen ─────────────────────────────────────────
+            section(3, "ALERT SCREEN",
+                    "What viewers see. Each style recreates a real EAS encoder or cable box. Styles marked "
+                    "'over the live program' draw on top of the channel, so they take a few seconds longer "
+                    "to appear and use more CPU."),
+            {"id": "eas_overlay_style", "type": "select", "label": "Screen style", "default": "dasdec",
+             "options": [{"value": k, "label": lbl} for k, lbl in STYLE_CATALOG]},
+            {"id": "eas_aspect", "type": "select", "label": "Older 4:3 screens on a widescreen TV",
+             "default": "pillarbox",
+             "options": [{"value": "pillarbox", "label": "Black bars on the sides (like the real equipment)"},
+                         {"value": "stretch",   "label": "Stretch to fill the screen (like many cable boxes)"}]},
+            {"id": "eas_sd_look", "type": "select", "label": "Old SD cable look", "default": "legacy",
+             "help_text": "Renders the screen through a 480-line path with smeared colour, like the SD "
+                          "encoders and cable channels of the time.",
+             "options": [{"value": "legacy", "label": "Older styles only (DASDEC legacy, EASyPLUS, EASyCAP, Gorman-Redlich, VDS)"},
+                         {"value": "all",    "label": "All full-screen styles"},
+                         {"value": "off",    "label": "Off — clean HD"}]},
+            {"id": "eas_details_channel", "type": "select", "label": "EAS details channel (optional)",
+             "default": "none",
+             "help_text": "Like a cable system that force-tunes every box to one channel during an alert: "
+                          "viewers see a couple of seconds of this channel, then it freezes, goes black and "
+                          "the alert comes up. Leave on 'none' and the channel being watched freezes, goes "
+                          "black, then the alert. This channel never gets alerts itself.",
+             "options": [{"value": "none", "label": "— none —"}] + channel_picker},
+            {"id": "eas_show_cap_text", "type": "boolean", "label": "Show the full alert text", "default": True,
+             "help_text": "On: after the 'has issued…' line, show the details (what, where, instructions). "
+                          "Off: only the short ENDEC translation."},
+            {"id": "eas_operator_name", "type": "string", "label": "Your 'cable company' name (optional)",
+             "help_text": "Used when tests or custom alerts come from you: '<name> has issued A REQUIRED "
+                          "WEEKLY TEST…'. Blank = 'A broadcast station or cable system'.",
+             "placeholder": "e.g. Your Cable Co."},
+            note("timing", "Timing — pages and bars loop until the alert ends."),
+            {"id": "eas_page_secs", "type": "number", "label": "Seconds per page", "default": 7,
+             "min": 3, "max": 30,
+             "help_text": "DASDEC, EASyCAP and Gorman-Redlich pages."},
+            {"id": "eas_sara_secs", "type": "number", "label": "Seconds per SARA bar chunk", "default": 3,
+             "min": 1, "max": 15},
+            {"id": "eas_crawl_speed", "type": "number", "label": "Crawl speed (1 slow – 10 fast)",
+             "default": 5, "min": 1, "max": 10,
+             "help_text": "Scrolling text: EASyPLUS, VDS, tickers."},
+            note("dasdec", "DASDEC options"),
+            {"id": "eas_dasdec_heading", "type": "string", "label": "Page heading",
+             "help_text": "Blank = the style's own heading. Type none for no heading.",
+             "placeholder": "Emergency Alert System"},
+            {"id": "eas_bg_color", "type": "select", "label": "Background colour", "default": "default",
+             "options": [{"value": "default",    "label": "Style default"},
+                         {"value": "purpleblue", "label": "Purple-blue (DASDEC default)"},
+                         {"value": "blue",       "label": "Blue"},
+                         {"value": "black",      "label": "Black"},
+                         {"value": "red",        "label": "Red"},
+                         {"value": "maroon",     "label": "Dark red"},
+                         {"value": "orange",     "label": "Orange"}]},
+            {"id": "eas_spanish", "type": "boolean", "label": "Add Spanish pages", "default": False,
+             "help_text": "Like DASDEC's English + Spanish translation option. VDS shows the event in Spanish too."},
+            note("easy", "EASyPLUS / VDS options"),
+            {"id": "eas_tune_to", "type": "string", "label": "'Tune to channel' line (optional)",
+             "placeholder": "Tune to Channel 15 for Further Information"},
+            {"id": "eas_legacy_originator", "type": "boolean", "label": "Early EASyPLUS wording",
+             "default": False,
+             "help_text": "Shows 'Broadcast Station or Cable System' instead of 'EAS Participant'."},
 
-            # 3 - Performance
-            {"id": "_eas_perf_header", "type": "info", "label": "──────  3 · PERFORMANCE  ──────"},
-            {"id": "_eas_transcode_note", "type": "info",
-             "label": "During an alert (only) the channel is re-encoded by FFmpeg to draw the overlay, so it briefly uses more CPU; it returns to pass-through the moment the alert clears. If an alert buffers or stutters, step this down. High-framerate sources (59.94fps) cost about double a 29.97fps source."},
-            {"id": "eas_transcode_mode", "type": "select", "label": "Transcode Quality (during alerts)",
-             "options": [
-                 {"value": "full",    "label": "Full — source resolution & framerate (default; best CPU/GPU)"},
-                 {"value": "1080p30", "label": "1080p30 — full res, capped at 30fps (try first if buffering)"},
-                 {"value": "720p",    "label": "720p — scaled down, source framerate (big CPU saving)"},
-                 {"value": "720p30",  "label": "720p30 — scaled down & capped at 30fps (max CPU saving)"},
-             ]},
-            {"id": "_eas_leadin_note", "type": "info",
-             "label": "Overlay lead-in: seconds of silence held before the alert tones start, so the on-screen overlay has time to appear first. The overlay is drawn on the live channel, which can take a few seconds to reconnect after switching to the alert, while the tones are instant — without a lead-in the header tones play over a blank picture. Set this roughly to how long your channels take to come back after a switch (4 is a good start; lower it if your streams reconnect fast, raise it if the tones still beat the picture)."},
-            {"id": "eas_lead_in_secs", "type": "number", "label": "Overlay Lead-in (seconds before tones, default 4)", "min": 0, "max": 15},
+            # ── 4 · Sound ────────────────────────────────────────────────
+            section(4, "SOUND",
+                    "During an alert the channel's audio is replaced by: SAME header tones → attention tone → "
+                    "spoken readout → end-of-message tones."),
+            {"id": "eas_generate_tones", "type": "boolean", "label": "Real SAME tones for each alert",
+             "default": True,
+             "help_text": "On: the header tones carry this alert's real data (event, counties, time) like a "
+                          "real encoder. Off: play the WAV files in the plugin's wav/ folder."},
+            {"id": "eas_att_secs", "type": "number", "label": "Attention tone length (seconds)", "default": 8,
+             "min": 8, "max": 25, "help_text": "The FCC allows 8–25 seconds; 8 is typical."},
+            {"id": "eas_tts_enabled", "type": "boolean", "label": "Read the alert aloud", "default": True,
+             "help_text": "Built in — nothing to install."},
+            {"id": "eas_tts_voice", "type": "select", "label": "Voice", "default": "kal16",
+             "options": [{"value": k, "label": l} for k, l in TTS_VOICES]},
+            {"id": "eas_tts_fx", "type": "select", "label": "Voice sound", "default": "endec",
+             "options": [{"value": k, "label": l} for k, l in TTS_FX]},
+            {"id": "eas_tts_speed", "type": "number", "label": "Speaking speed", "default": 1.0,
+             "min": 0.6, "max": 1.6, "help_text": "1.0 = normal."},
+            {"id": "eas_use_cap_audio", "type": "boolean", "label": "Use the alert's own recorded message",
+             "default": True,
+             "help_text": "IPAWS alerts (and alerts heard on a monitored channel) often carry the "
+                          "originator's own audio. Like a DASDEC, play that instead of the synthesized voice."},
+            note("levels", "Levels and the encoder's audio output"),
+            {"id": "eas_loudness", "type": "select", "label": "Loudness", "default": "-24",
+             "help_text": "The spoken message is levelled to this, so the alert sits where the channel sits.",
+             "options": [{"value": k, "label": l} for k, l in LOUDNESS_TARGETS]},
+            {"id": "eas_tone_offset_lu", "type": "number", "label": "Tones louder than the voice by (LU)",
+             "default": 8, "min": 0, "max": 20,
+             "help_text": "Real EAS tones are noticeably louder than programme audio. 0 = same level."},
+            {"id": "eas_audio_channels", "type": "select", "label": "Encoder audio output", "default": "both",
+             "help_text": "Some headends only fed the EAS audio to one side.",
+             "options": [{"value": k, "label": l} for k, l in AUDIO_CHANNEL_MODES]},
+            {"id": "eas_audio_hum", "type": "select", "label": "Mains hum", "default": "off",
+             "help_text": "A faint ground-loop hum under the alert, like an analog headend.",
+             "options": [{"value": "off", "label": "Off"}, {"value": "60", "label": "60 Hz (North America)"},
+                         {"value": "50", "label": "50 Hz"}]},
+            {"id": "eas_audio_click", "type": "boolean", "label": "Audio switch click", "default": True,
+             "help_text": "The relay click and short dip as the encoder switches the audio over."},
+            {"id": "eas_program_audio", "type": "select", "label": "Programme audio (over-the-program styles)",
+             "default": "switch",
+             "help_text": "For styles drawn over the live channel.",
+             "options": [{"value": "switch", "label": "Audio switch — programme off during the EAS audio, back after the EOM (DASDEC)"},
+                         {"value": "duck",   "label": "Duck — programme kept low under the alert"},
+                         {"value": "mute",   "label": "Mute until the alert screen goes away"}]},
+            {"id": "eas_duck_db", "type": "number", "label": "Duck programme by (dB)", "default": 18,
+             "min": 6, "max": 40},
 
-            # 3b - Notifications & logging
-            {"id": "_eas_notify_header", "type": "info", "label": "──────  NOTIFICATIONS & LOG  ──────"},
-            {"id": "_eas_notify_note", "type": "info",
-             "label": "Push a message to Discord, ntfy, or any webhook when an alert fires and when it clears. Paste a Discord webhook URL, an ntfy topic URL (https://ntfy.sh/your-topic), or any endpoint that accepts a JSON POST. Every alert action is also written to an FCC-style CSV log at emergencyalertarr_data/eas_fcc_log.csv (timestamp, action, event, severity, area, channels) whether or not notifications are on."},
-            {"id": "eas_notify_enabled", "type": "boolean", "label": "Send webhook notifications"},
-            {"id": "eas_webhook_url", "type": "text", "label": "Webhook URL (Discord / ntfy / generic JSON)", "placeholder": "https://discord.com/api/webhooks/... or https://ntfy.sh/my-eas"},
-            {"id": "eas_notify_events", "type": "select", "label": "Notify on",
-             "options": [
-                 {"value": "both",  "label": "Both fire and clear"},
-                 {"value": "fire",  "label": "Only when an alert fires"},
-                 {"value": "clear", "label": "Only when an alert clears"},
-             ]},
+            # ── 5 · Tests ────────────────────────────────────────────────
+            section(5, "TESTS",
+                    "\"Test EAS Alert\" plays a test on the chosen channels right away. Weekly tests are "
+                    "tones only (header + end), monthly tests add the attention tone and the test script — "
+                    "the same as real stations (47 CFR 11.61)."),
+            {"id": "eas_test_type", "type": "select", "label": "Test button plays", "default": "monthly",
+             "options": [{"value": "monthly", "label": "Required Monthly Test (RMT)"},
+                         {"value": "weekly",  "label": "Required Weekly Test (RWT)"}]},
+            {"id": "eas_test_area", "type": "string", "label": "Area named in tests (optional)",
+             "help_text": "Blank = the county names of the locations below.",
+             "placeholder": "e.g. Dallas County, Texas"},
+            {"id": "eas_test_locations", "type": "string", "label": "Locations in test / custom headers",
+             "help_text": "6-digit SAME codes (up to 31), like the counties a station covers. More counties = a "
+                          "longer header. Blank = your IPAWS county codes, else your NWS county zones.",
+             "placeholder": "048113, 048121, 048439"},
+            {"id": "eas_test_schedule", "type": "select", "label": "Automatic tests", "default": "off",
+             "help_text": "Only plays on channels someone is watching.",
+             "options": [{"value": "off",       "label": "Off"},
+                         {"value": "realistic", "label": "Like a real station — monthly test + random weekly tests"},
+                         {"value": "weekly",    "label": "Weekly test at a fixed day and hour"},
+                         {"value": "monthly",   "label": "Monthly test at a fixed day and hour"}]},
+            {"id": "eas_test_day", "type": "number", "label": "Test day", "default": 1, "min": 0, "max": 28,
+             "help_text": "Weekly: 0 = Monday … 6 = Sunday. Monthly / realistic: day of the month (1–28)."},
+            {"id": "eas_test_hour", "type": "number", "label": "Test hour (0–23)", "default": 12,
+             "min": 0, "max": 23, "help_text": "Fixed schedules only. 'Like a real station' picks its own times."},
 
-            # 4 - Alert audio
-            {"id": "_eas_audio_header", "type": "info", "label": "──────  4 · ALERT AUDIO  ──────"},
-            {"id": "_eas_gentone_note", "type": "info",
-             "label": "Tone generation (recommended ON): EmergencyAlertarr synthesizes the EAS tones itself — a real AFSK SAME header built from the live alert (originator, event code, counties, valid time, so bigger alerts get a longer header, like a real ENDEC), the two-tone attention signal, and the EOM tones. No WAV files needed. Turn OFF only if you'd rather supply your own eas_header.wav / eas_att.wav / eas_eom.wav in the plugin folder."},
-            {"id": "eas_generate_tones", "type": "boolean", "label": "Generate EAS tones automatically (no WAV files needed)"},
-            {"id": "eas_att_secs", "type": "number", "label": "Attention Tone length (seconds — only when tones are generated; broadcast EAS uses 8, real range 8–25)", "min": 4, "max": 30},
-            {"id": "_eas_tts_note", "type": "info",
-             "label": "Spoken readout (TTS): reads the alert aloud (offline) in the gap between the attention and EOM tones. For a natural, real-ENDEC-sounding voice install Piper — a neural TTS — and point it at a voice model; pico2wave (svox) is a clearer classic voice; espeak-ng is the robotic fallback. If none are installed, alerts use the silent gap. Piper voices: download a .onnx model (e.g. en_US-lessac-medium or en_US-ryan-high from the piper-voices project), put it in the plugin's tts/ folder or set its path below."},
-            {"id": "eas_tts_enabled", "type": "boolean", "label": "Read the alert aloud (TTS)"},
-            {"id": "eas_tts_engine", "type": "select", "label": "TTS Voice Engine",
-             "options": [
-                 {"value": "auto",   "label": "Auto — best installed (Piper › pico › espeak)"},
-                 {"value": "piper",  "label": "Piper — natural neural voice (recommended; needs a model)"},
-                 {"value": "pico",   "label": "pico2wave — clearer classic voice"},
-                 {"value": "espeak", "label": "espeak-ng — robotic (fallback)"},
-             ]},
-            {"id": "eas_tts_model", "type": "text", "label": "Piper voice model path (.onnx)", "placeholder": "e.g. /data/plugins/emergencyalertarr/tts/en_US-ryan-high.onnx"},
-            {"id": "eas_tts_voice", "type": "text", "label": "Voice/language for pico or espeak (optional)", "placeholder": "e.g. en-US"},
-            {"id": "eas_silence_secs",  "type": "number", "label": "Silent gap length (seconds, 10–20) — used only when TTS is OFF/unavailable; when TTS is ON the gap is sized to the readout", "min": 10, "max": 20},
+            # ── 6 · Custom alert ─────────────────────────────────────────
+            section(6, "CUSTOM ALERT",
+                    "Fill in and press \"Inject Custom Alert\" to send your own alert to the chosen "
+                    "channels — same screen, tones and voice as a real one."),
+            {"id": "eas_inject_template", "type": "select", "label": "Template", "default": "custom",
+             "help_text": "Fills in the event code, message, instructions, sender and valid time. "
+                          "Anything you type below overrides it.",
+             "options": [{"value": k, "label": l} for k, l in TEMPLATE_CHOICES]},
+            {"id": "eas_inject_event", "type": "string", "label": "Event",
+             "placeholder": "Civil Emergency Message"},
+            {"id": "eas_inject_area", "type": "string", "label": "Area", "placeholder": "e.g. Dallas County, Texas"},
+            {"id": "eas_inject_message", "type": "text", "label": "Message",
+             "placeholder": "A water main break has closed Main St. Avoid the area."},
+            {"id": "eas_inject_instruction", "type": "text", "label": "Instructions (optional)",
+             "placeholder": "Use an alternate route and monitor local news."},
+            {"id": "eas_inject_sender", "type": "string", "label": "From", "default": "EAS Participant",
+             "help_text": "Who issued it, e.g. EAS Participant, County Emergency Management."},
+            {"id": "eas_inject_severity", "type": "select", "label": "Severity", "default": "Severe",
+             "options": [{"value": "Minor", "label": "Minor"}, {"value": "Moderate", "label": "Moderate"},
+                         {"value": "Severe", "label": "Severe"}, {"value": "Extreme", "label": "Extreme"}]},
+            {"id": "eas_inject_duration_min", "type": "number", "label": "Valid for (minutes)", "default": 30,
+             "min": 1, "max": 360},
 
-            # 5 - Tests
-            {"id": "_eas_test_header", "type": "info", "label": "──────  5 · TESTS  ──────"},
-            {"id": "_eas_test_type_note", "type": "info",
-             "label": "Controls the manual \"Test EAS Alert\" button and the announced area for scheduled tests. Test alerts are worded as a real RWT/RMT from \"EAS Participant\" (the standard test originator), not the Weather Service."},
-            {"id": "eas_test_type", "type": "select", "label": "Manual Test Type (\"Test EAS Alert\" button)",
-             "options": [
-                 {"value": "monthly", "label": "RMT — Required Monthly Test"},
-                 {"value": "weekly",  "label": "RWT — Required Weekly Test"},
-             ]},
-            {"id": "eas_test_area", "type": "text", "label": "Test Announce Area (optional — blank says \"this viewing area\")", "placeholder": "e.g. Tulsa County, Oklahoma"},
-            {"id": "_eas_sched_note", "type": "info",
-             "label": "Scheduled auto-test: fire an RWT or RMT automatically on a schedule, like a station's automated encoder. Only fires on channels that currently have a viewer."},
-            {"id": "eas_test_schedule", "type": "select", "label": "Auto-Test Schedule",
-             "options": [
-                 {"value": "off",     "label": "Off"},
-                 {"value": "weekly",  "label": "Weekly (RWT)"},
-                 {"value": "monthly", "label": "Monthly (RMT)"},
-             ]},
-            {"id": "eas_test_day", "type": "number", "label": "Test Day — Weekly: 0=Mon…6=Sun (default 2=Wed). Monthly: 1–28 (default 1)", "min": 0, "max": 28},
-            {"id": "eas_test_hour", "type": "number", "label": "Test Hour (0–23 local, default 12=noon)", "min": 0, "max": 23},
+            # ── 7 · Relay rules & monitoring ─────────────────────────────
+            section(7, "RELAY RULES & MONITORING",
+                    "What happens to each alert that comes in, like an ENDEC's filter table. Priority: "
+                    "a national alert (EAN) goes out at once, interrupts anything and holds the channels "
+                    "until it's over; a nationwide test goes out at once; warnings may cut into a test "
+                    "that's still playing; everything else waits its turn."),
+            {"id": "eas_rwt_action", "type": "select", "label": "Received weekly tests (RWT)", "default": "relay",
+             "options": [{"value": "relay", "label": "Relay — header + EOM on your channels"},
+                         {"value": "log",   "label": "Log only (factory Sage setting)"},
+                         {"value": "ignore", "label": "Ignore"}]},
+            {"id": "eas_rmt_action", "type": "select", "label": "Received monthly tests (RMT)", "default": "hold",
+             "help_text": "Stations must relay a received RMT within 60 minutes.",
+             "options": [{"value": "hold",  "label": "Relay after a hold (Sage default: 5 minutes)"},
+                         {"value": "relay", "label": "Relay immediately"},
+                         {"value": "log",   "label": "Log only"},
+                         {"value": "ignore", "label": "Ignore"}]},
+            {"id": "eas_rmt_hold_min", "type": "number", "label": "RMT hold (minutes)", "default": 5,
+             "min": 0, "max": 60},
+            {"id": "eas_other_action", "type": "select", "label": "Everything else", "default": "relay",
+             "options": [{"value": "relay", "label": "Relay immediately"},
+                         {"value": "hold",  "label": "Relay after a hold"},
+                         {"value": "log",   "label": "Log only"}]},
+            {"id": "eas_other_hold_min", "type": "number", "label": "Hold for everything else (minutes)",
+             "default": 10, "min": 0, "max": 120},
+            {"id": "eas_filter_rules", "type": "text", "label": "Custom rules (optional)",
+             "help_text": "One per line: event codes = relay | hold N | log | ignore [priority 0-63]. "
+                          "Example: 'FLS, SPS = log' or 'SVA = hold 10'.",
+             "placeholder": "FLS, SPS = log\nSVA, TOA = hold 10"},
+            {"id": "eas_relay_own_id", "type": "boolean", "label": "Put my station ID in relayed headers",
+             "default": True,
+             "help_text": "Like a real relay: the header carries your station ID, but keeps the "
+                          "originator's issue time and valid period."},
+            note("monitor", "Monitor a channel for EAS tones"),
+            {"id": "eas_monitor_channel", "type": "select", "label": "Monitored channel", "default": "none",
+             "help_text": "Listens to this channel's audio around the clock (like an ENDEC's LP-1 "
+                          "monitoring assignment) and relays what it airs: its header, its recorded "
+                          "message, then the EOM. Alerts you already got from NWS/IPAWS are recognised as "
+                          "duplicates and not played twice. Uses one stream connection to that channel "
+                          "permanently. The channel itself never gets alerts.",
+             "options": [{"value": "none", "label": "— off —"}] + channel_picker},
 
-            # 6 - Custom alert injection
-            {"id": "_eas_inject_header", "type": "info", "label": "──────  6 · CUSTOM ALERT INJECTION  ──────"},
-            {"id": "_eas_inject_note", "type": "info",
-             "label": "Fill these in, then use the \"Inject Custom Alert\" action button to broadcast your own alert on the monitored channel(s) — full overlay, tones, and readout, just like a real alert. Good for local announcements or trying out a look."},
-            {"id": "eas_inject_event", "type": "text", "label": "Event Name", "placeholder": "e.g. Civil Emergency Message"},
-            {"id": "eas_inject_area", "type": "text", "label": "Area", "placeholder": "e.g. Tulsa County, Oklahoma"},
-            {"id": "eas_inject_message", "type": "text", "label": "Message / Headline", "placeholder": "e.g. A water main break has closed Main St. Avoid the area."},
-            {"id": "eas_inject_instruction", "type": "text", "label": "Instruction (optional)", "placeholder": "e.g. Seek an alternate route and monitor local news."},
-            {"id": "eas_inject_sender", "type": "text", "label": "Sender / Originator (default: EAS Participant)", "placeholder": "default: EAS Participant"},
-            {"id": "eas_inject_severity", "type": "select", "label": "Severity",
-             "options": [
-                 {"value": "Minor",    "label": "Minor"},
-                 {"value": "Moderate", "label": "Moderate"},
-                 {"value": "Severe",   "label": "Severe"},
-                 {"value": "Extreme",  "label": "Extreme"},
-             ]},
-            {"id": "eas_inject_duration_min", "type": "number", "label": "Effective Duration (minutes — shown as the Expires time, default 30)", "min": 1, "max": 360},
-
-            # 7 - Channels to monitor
-            {"id": "_eas_chan_header", "type": "info", "label": "──────  7 · CHANNELS TO MONITOR  ──────"},
-            {"id": "_eas_allchannels_warn", "type": "info",
-             "label": "Pick which channels get EAS monitoring, then use the \"Enable EAS\" action to arm them. Armed channels play normally and only switch to the alert overlay when something fires. Use the Enable / Disable action buttons to turn monitoring on or off."},
-            {"id": "eas_target_type",   "type": "select", "label": "Apply To",
-             "options": [{"value": "all", "label": "All Channels"}, {"value": "group", "label": "Channel Group"}, {"value": "groups", "label": "Multiple Groups (CSV)"}, {"value": "channel", "label": "Single Channel"}]},
-            {"id": "_eas_target_note",         "type": "info",   "label": "Fill in only the field matching your Apply To choice above — leave the rest blank."},
-            {"id": "eas_channel_group_id",    "type": "select", "label": "Channel Group (for 'Channel Group')",             "options": groups},
-            {"id": "eas_channel_group_names", "type": "text",   "label": "Group Names (for 'Multiple Groups' — comma-separated)", "placeholder": "e.g. News, Locals, Networks"},
-            {"id": "eas_channel_id",          "type": "select", "label": "Channel (for 'Single Channel')",                 "options": channels},
-            {"id": "eas_exclude_groups",      "type": "text",   "label": "Exclude Groups (optional — comma-separated names to skip)", "placeholder": "e.g. Music, Radio"},
-
-            # Status
-            {"id": "_active_section", "type": "info", "label": "══════════  STATUS  ══════════"},
-            {"id": "_ticker_list",    "type": "info", "label": active_label},
+            # ── 8 · Advanced ─────────────────────────────────────────────
+            section(8, "ADVANCED", "You normally don't need to change anything below."),
+            {"id": "eas_poll_interval", "type": "number", "label": "Check for alerts every (seconds)",
+             "default": 60, "min": 15},
+            {"id": "eas_alert_gap_secs", "type": "number", "label": "Quiet time between two alerts (seconds)",
+             "default": 60, "min": 0, "max": 3600,
+             "help_text": "When several alerts are waiting, normal TV plays this long between them. "
+                          "With the area set to ALL it is at least 300."},
+            {"id": "eas_max_alert_age_min", "type": "number", "label": "Skip alerts older than (minutes)",
+             "default": 20, "min": 5, "max": 720,
+             "help_text": "Alerts issued longer ago than this are never played, so a backlog can't pile up."},
+            {"id": "eas_transcode_mode", "type": "select", "label": "Alert video resolution", "default": "full",
+             "options": [{"value": "full", "label": "1080p"},
+                         {"value": "720p", "label": "720p — lighter on CPU"}]},
+            {"id": "eas_station_id", "type": "string", "label": "Station ID (8 characters)",
+             "help_text": "Your 'call sign' in the SAME header and 'Message from …' for tests and custom alerts.",
+             "placeholder": "EAA/IPTV"},
+            {"id": "eas_fcc2023_wording", "type": "boolean", "label": "Current FCC names", "default": True,
+             "help_text": "Uses the 2023 names: 'United States Government', 'National Emergency Message', "
+                          "'Nationwide Test of the Emergency Alert System'."},
+            {"id": "eas_endec_test_mode", "type": "boolean", "label": "Weekly tests are tones only",
+             "default": True, "help_text": "Off: weekly tests also get the attention tone and readout."},
+            {"id": "eas_endec_tail_secs", "type": "number", "label": "Screen stays up after a weekly test (seconds)",
+             "default": 7.5, "min": 1, "max": 30},
+            {"id": "eas_silence_secs", "type": "number", "label": "Silent gap when there's no readout (seconds)",
+             "default": 15, "min": 10, "max": 20},
+            {"id": "eas_ipaws_feeds", "type": "string", "label": "IPAWS feeds", "default": "eas",
+             "help_text": "Comma-separated: eas, wea, public."},
+            {"id": "eas_easyplus_font_scale", "type": "number", "label": "Text size", "default": 1.0,
+             "min": 0.5, "max": 3, "help_text": "1.0 = same size as the real equipment."},
+            {"id": "eas_easyplus_font", "type": "string", "label": "Font override",
+             "help_text": "A .ttf/.otf filename in the plugin's fonts/ folder (or a full path). Blank = the style's own font."},
+            {"id": "eas_tts_engine", "type": "select", "label": "Speech engine", "default": "auto",
+             "options": [{"value": k, "label": l} for k, l in TTS_ENGINES]},
+            {"id": "eas_tts_custom_cmd", "type": "string", "label": "Custom speech command",
+             "help_text": "Speech engine = Custom. Placeholders: {textfile} {text} {out} (WAV output).",
+             "placeholder": "/opt/dectalk/say -fi {textfile} -fo {out}"},
+            {"id": "eas_tts_piper_model", "type": "string", "label": "Piper voice model (.onnx)",
+             "help_text": "Speech engine = Piper.", "placeholder": "/data/piper/en_US-ryan-medium.onnx"},
         ]
 
     def run(self, action, params, context):
@@ -2908,11 +4496,13 @@ class Plugin:
             "inject_alert":         self._inject_alert,
             "view_history":         self._view_history,
             "clear_history":        self._clear_history,
+            "migrate_eas":          self._migrate_eas,
             "view_active":          self._view_active,
             "refresh_channels":     self._refresh_channels,
+            "clean_orphans":        self._clean_orphans,
             "reset_all_eas":        self._reset_all_eas,
+            "stop_alerts":          self._stop_alerts,
             "redis_diag":           self._redis_diag,
-            "fetch_alerts":         self._fetch_alerts_now,
             "reload_poller":        self._reload_poller,
             "restart_dispatcharr":  self._restart_dispatcharr,
         }
@@ -2920,6 +4510,16 @@ class Plugin:
         if not handler:
             return {"success": False, "message": f"Unknown action: {action}"}
         try:
+            if action in _EAS_LOCKED_ACTIONS:
+                # Same lock the background sweep/restore tick use, so a button
+                # press and the poller can never overwrite each other's
+                # mappings.json changes.
+                with _EasMutex(wait=20) as held:
+                    if not held:
+                        return {"success": False, "message":
+                                "EmergencyAlertarr is busy switching an alert right now -- "
+                                "try again in a few seconds."}
+                    return handler(params)
             return handler(params)
         except Exception as e:
             logger.error(f"emergencyalertarr: action {action} failed: {e}", exc_info=True)
@@ -2991,11 +4591,11 @@ class Plugin:
             return {"success": False, "message":
                     "Can't enable EAS — the selected Alert Source (" + source +
                     ") needs: " + "; ".join(missing) +
-                    ". Set it in EAS settings above, then enable again."}
+                    ". Fill it in under section 2 · YOUR AREA, save, then enable again."}
 
         channels = self._resolve_channels(params, prefix="eas_")
         if not channels:
-            return {"success": False, "message": "No channels found. Set the EAS Weather Alerts > Apply To / Channel selector above."}
+            return {"success": False, "message": "No channels selected. Choose them in section 1 · CHANNELS, save, then try again."}
 
         mappings = _get_mappings()
         enabled, skipped, failed = [], [], []
@@ -3022,11 +4622,8 @@ class Plugin:
                         # No clone currently active, so the channel's current profile
                         # genuinely is the original -- safe to repair the mapping
                         # instead of carrying broken legacy data forward.
-                        current_profile = channel.stream_profile
-                        if not current_profile:
-                            skipped.append(f"{channel.name} (legacy mapping missing original profile, and no current stream profile to recover it from — assign one in Channels first)")
-                            continue
-                        existing["original_profile_id"] = current_profile.id
+                        current_profile = _eas_effective_profile(channel)
+                        existing["original_profile_id"] = current_profile.id if current_profile else None
                         logger.warning(f"emergencyalertarr: repaired legacy mapping for {channel.name} (ch {cid}) — backfilled missing original_profile_id")
                     # Co-arm EAS alongside the existing ticker without disrupting it
                     _eas_clear(channel.id)
@@ -3034,16 +4631,17 @@ class Plugin:
                     mappings[cid] = existing
                     enabled.append(channel.name)
                     continue
-                original_profile = channel.stream_profile
-                if not original_profile:
-                    skipped.append(f"{channel.name} (no stream profile assigned — assign one in Channels first)")
-                    continue
-                if original_profile.name.startswith(PROFILE_PREFIX):
+                # Override-aware; None = the channel uses the system default
+                # profile, which is fine now (the alert profile no longer needs
+                # the channel's own FFmpeg parameters). Those channels used to
+                # be skipped, so "All Channels" quietly armed only some of them.
+                original_profile = _eas_effective_profile(channel)
+                if original_profile and original_profile.name.startswith(PROFILE_PREFIX):
                     skipped.append(f"{channel.name} (already has a EmergencyAlertarr profile — disable first)")
                     continue
                 _eas_clear(channel.id)
                 mappings[cid] = {
-                    "original_profile_id": original_profile.id,
+                    "original_profile_id": original_profile.id if original_profile else None,
                     "channel_name":        channel.name,
                     "type":                "eas",
                 }
@@ -3056,7 +4654,7 @@ class Plugin:
         parts = []
         if enabled:
             parts.append(f"EAS registered: {len(enabled)} channel(s)\n" + "\n".join(f"  - {e}" for e in enabled))
-            parts.append(f"Monitoring zones: {zones}\nChannels continue using their normal profile. When a qualifying NWS alert fires, they automatically switch to the EAS overlay and restart. No re-encoding overhead until an actual alert occurs.")
+            parts.append("These channels keep playing normally and switch to the alert screen only while an alert for your area is playing. Press \"Test EAS Alert\" to try it.")
         if skipped: parts.append("Skipped:\n" + "\n".join(f"  - {s}" for s in skipped))
         if failed:  parts.append("Failed:\n"  + "\n".join(f"  - {f}" for f in failed))
         return {"success": not failed, "message": "\n\n".join(parts) or "Nothing to do."}
@@ -3064,7 +4662,7 @@ class Plugin:
     def _disable_eas(self, params):
         channels = self._resolve_channels(params, prefix="eas_")
         if not channels:
-            return {"success": False, "message": "No channels found. Set the EAS Weather Alerts > Apply To / Channel selector above."}
+            return {"success": False, "message": "No channels selected. Choose them in section 1 · CHANNELS, save, then try again."}
         mappings = _get_mappings()
         disabled, skipped, failed = [], [], []
         for channel in channels:
@@ -3076,9 +4674,12 @@ class Plugin:
                 skipped.append(f"{channel.name} (no EAS ticker active)")
                 continue
             try:
-                if mapping.get("eas_profile_id"):
-                    _restore_profile(channel, mapping.get("original_profile_id"))
-                    _delete_cloned_profile(mapping["eas_profile_id"])
+                if mapping.get("eas_profile_id") or mapping.get("eas_passthrough_id"):
+                    _restore_profile(channel, mapping.get("original_profile_id"), slot=mapping.get("eas_slot"))
+                    if mapping.get("eas_profile_id"):
+                        _delete_cloned_profile(mapping["eas_profile_id"])
+                    _eas_delete_passthrough(mapping.get("eas_passthrough_id"))
+                    _restart_channel_stream_async(channel, label="EAS")
                 _eas_clear(channel.id)
                 with _eas_lock:
                     _eas_active.pop(cid, None)
@@ -3086,8 +4687,10 @@ class Plugin:
                     del mappings[cid]
                 else:
                     # Co-armed: remove EAS keys, leave the ticker mapping intact
-                    mapping.pop("eas_armed", None)
-                    mapping.pop("eas_profile_id", None)
+                    for k in ("eas_armed", "eas_profile_id", "eas_restore_at", "eas_await_stream",
+                              "eas_seen_down", "eas_seq_secs", "eas_slot", "eas_hard_deadline",
+                              "eas_fired_at", "eas_national", "eas_priority", "eas_gone_since"):
+                        mapping.pop(k, None)
                     mappings[cid] = mapping
                 disabled.append(channel.name)
             except Exception as e:
@@ -3101,166 +4704,84 @@ class Plugin:
         return {"success": not failed, "message": "\n\n".join(parts) or "Nothing to do."}
 
     def _test_eas(self, params):
-        """Fire a fake EAS alert on EAS-enabled channels for a configurable duration, then auto-restore."""
-        import threading as _threading
+        """Fire a test EAS alert (RWT/RMT) on EAS-enabled channels, then auto-restore."""
         channels = self._resolve_channels(params, prefix="eas_")
         if not channels:
-            return {"success": False, "message": "No channels found. Select a channel in the EAS section."}
+            return {"success": False, "message": "No channels selected. Choose them in section 1 · CHANNELS, save, then try again."}
 
-        mappings  = _get_mappings()
         settings  = _get_settings()
-        streaming_ids = _eas_streaming_ids()
-        fired, skipped, failed = [], [], []
+        test_type = (settings.get("eas_test_type") or "monthly").lower()
+        test_area = (settings.get("eas_test_area") or "").strip() or None
 
-        for channel in channels:
-            cid = str(channel.id)
-            mapping = mappings.get(cid)
-            if not mapping or (mapping.get("type") != "eas" and not mapping.get("eas_armed")):
-                skipped.append(f"{channel.name} (no EAS ticker active — enable it first)")
-                continue
-            if cid not in streaming_ids:
-                # Only fire on channels someone is actually watching, so a test
-                # can't leave the overlay stuck on idle channels.
-                skipped.append(f"{channel.name} (not currently being watched — tune to it first)")
-                continue
-            if mapping.get("eas_profile_id"):
-                skipped.append(f"{channel.name} (EAS already active — clear it first)")
-                continue
-            try:
-                from core.models import StreamProfile
-                if not mapping.get("original_profile_id"):
-                    failed.append(f"{channel.name} (incomplete mapping data — no original profile saved; disable then re-enable EAS for this channel to fix)")
-                    continue
-                orig = StreamProfile.objects.filter(id=mapping.get("original_profile_id")).first()
-                if not orig:
-                    failed.append(f"{channel.name} (original profile missing)")
-                    continue
-
-                silence_secs   = max(10, min(20, int(settings.get("eas_silence_secs") or 15)))
-                transcode_mode = settings.get("eas_transcode_mode")  or "full"
-                overlay_style  = (settings.get("eas_overlay_style") or "easyplus").lower()
-                use_tts        = bool(settings.get("eas_tts_enabled", True))
-                test_type      = (settings.get("eas_test_type") or "monthly").lower()
-                test_area      = (settings.get("eas_test_area") or "").strip() or None
-                # RMT (monthly) always plays the full sequence -- attention tone +
-                # spoken readout. Only RWT (weekly) uses the tones-only ENDEC test
-                # (header -> EOM), and only when the ENDEC toggle is on.
-                endec_test     = (test_type == "weekly")   # RWT = tones-only ENDEC; RMT = full readout
-                generate_tones = bool(settings.get("eas_generate_tones", False))
-                try:
-                    att_secs   = max(4.0, min(30.0, float(settings.get("eas_att_secs") or 8)))
-                except Exception:
-                    att_secs   = 8.0
-                try:
-                    tail_secs  = max(1.0, min(30.0, float(settings.get("eas_endec_tail_secs") or 7.5)))
-                except Exception:
-                    tail_secs  = 7.5
-
-                from datetime import datetime, timedelta, timezone as _tz
-                now_utc = datetime.now(_tz.utc)
-                # Realistic RWT/RMT copy; expires refined below once duration known.
-                fake_alerts = [_eas_build_test_alert(test_type, now_utc, area=test_area)]
-
-                _ep_font, _ep_scale = _easyplus_settings(settings)
-                _lead_in = float(settings.get("eas_lead_in_secs") or 0)
-                eas_profile, _, seq_duration = _clone_and_inject_eas(
-                    channel.id, orig, channel.name,
-                    silence_secs, transcode_mode,
-                    style=overlay_style, unique_alerts=fake_alerts, use_tts=use_tts,
-                    endec_test=endec_test, tail_secs=tail_secs,
-                    generate_tones=generate_tones, att_secs=att_secs,
-                    easyplus_font=_ep_font, easyplus_scale=_ep_scale,
-                    lead_in_secs=_lead_in,
-                )
-                _assign_profile(channel, eas_profile)
-
-                # Now that we know the real sequence duration, set a matching expires.
-                fake_alerts[0]["expires"] = (now_utc + timedelta(seconds=seq_duration)).isoformat()
-                _eas_write_alert(cid, fake_alerts, style=overlay_style)
-                # Use eas_restore_at so the sweep loop handles the timed restore --
-                # survives worker reloads, no daemon thread needed.
-                # Use "test" fingerprint so a real alert after the test fires fresh.
-                # Add a reconnect-grace buffer: stopping the channel and waiting
-                # for the stream to come back on the EAS profile burns several
-                # seconds of dead time. Without this pad the restore could fire
-                # before the viewer's stream finished reconnecting, so they'd
-                # never see the overlay. The grace keeps the alert window open
-                # long enough for the reconnect to land inside it.
-                mapping["eas_profile_id"] = eas_profile.id
-                _eas_arm_restore(mapping, seq_duration, time.time())
-                mappings[cid] = mapping
-                rc = _get_redis_client()
-                if rc:
-                    try:
-                        raw_st = rc.get(_EAS_STATE_KEY)
-                        st = json.loads(raw_st) if raw_st else {}
-                        st[cid] = "__test__"
-                        rc.setex(_EAS_STATE_KEY, 3600, json.dumps(st))
-                    except Exception:
-                        pass
-                _restart_channel_stream_async(channel, label="EAS", proactive=True)
-                fired.append((cid, channel.name, eas_profile.id, str(channel.uuid)))
-                _eas_history_add(
-                    fake_alerts[0].get("event"), fake_alerts[0].get("area"),
-                    channel.name, kind="test",
-                )
-
-            except Exception as e:
-                logger.error(f"emergencyalertarr: test_eas failed for {channel.name}: {e}", exc_info=True)
-                failed.append(f"{channel.name} (error: {e})")
+        from datetime import datetime, timezone as _tz
+        test_alert = _eas_build_test_alert(test_type, datetime.now(_tz.utc), area=test_area)
+        fired, notes = _eas_manual_fire(channels, test_alert, settings)
 
         if fired:
-            _save_mappings(mappings)
+            label = "Required Weekly Test" if test_type == "weekly" else "Required Monthly Test"
+            _eas_history_add(label, test_area or "this viewing area", fired, kind="test")
 
         parts = []
         if fired:
-            names = ", ".join(n for _, n, _, _ in fired)
-            parts.append(f"EAS test alert fired on: {names}\nThe overlay will auto-restore once the full tone + readout sequence finishes.")
-        if skipped:
-            parts.append("Skipped:\n" + "\n".join(f"  - {s}" for s in skipped))
-        if failed:
-            parts.append("Failed:\n" + "\n".join(f"  - {f}" for f in failed))
+            parts.append(f"EAS test alert fired on: {', '.join(fired)}\nThe overlay will auto-restore once the full tone + readout sequence finishes.")
+        parts += notes
         return {"success": bool(fired), "message": "\n\n".join(parts) or "Nothing to do."}
 
 
     def _inject_alert(self, params):
         """Fire a user-defined custom alert on the selected EAS channels, using
-        the text entered in the Manual Alert settings fields. Reuses the same
-        clone/overlay/TTS machinery as real alerts, so it looks and sounds
-        identical -- it just carries your custom event/area/message."""
+        the text entered in the Custom Alert Injection settings. Reuses the same
+        activation/overlay/TTS machinery as real alerts."""
         channels = self._resolve_channels(params, prefix="eas_")
         if not channels:
-            return {"success": False, "message": "No channels found. Select a channel/group in the EAS section first."}
+            return {"success": False, "message": "No channels selected. Choose them in section 1 · CHANNELS, save, then try again."}
 
         settings = _get_settings()
-        event = (settings.get("eas_inject_event") or "").strip()
-        if not event:
-            return {"success": False, "message": "Enter a Custom Alert Event name in settings before injecting (e.g. \"Civil Emergency Message\")."}
-        area    = (settings.get("eas_inject_area") or "").strip() or "this viewing area"
-        message = (settings.get("eas_inject_message") or "").strip()
-        instruction = (settings.get("eas_inject_instruction") or "").strip()
-        sender  = (settings.get("eas_inject_sender") or "EAS Participant").strip()
-        severity = (settings.get("eas_inject_severity") or "Severe")
+        from eaa_templates import apply_template
+        from eaa_fips import describe_codes
+        tkey = (settings.get("eas_inject_template") or "custom").lower()
+        templ = tkey != "custom"
+        typed_sender = (settings.get("eas_inject_sender") or "").strip()
+        typed_sev = settings.get("eas_inject_severity") or ""
         try:
-            duration_min = max(1, min(360, int(settings.get("eas_inject_duration_min") or 30)))
+            typed_min = int(settings.get("eas_inject_duration_min") or 0)
+        except Exception:
+            typed_min = 0
+        # With a template, the fields' factory defaults count as "not typed".
+        if templ:
+            if typed_sender == "EAS Participant":
+                typed_sender = ""
+            if typed_sev == "Severe":
+                typed_sev = ""
+            if typed_min == 30:
+                typed_min = 0
+        t = apply_template(tkey, settings.get("eas_inject_event") or "",
+                           settings.get("eas_inject_message") or "",
+                           settings.get("eas_inject_instruction") or "",
+                           typed_sender, typed_sev, typed_min or None)
+        event = t["event"]
+        if templ and (settings.get("eas_inject_event") or "").strip():
+            from eaa_templates import CUSTOM_TEMPLATES
+            tv = CUSTOM_TEMPLATES.get(tkey) or {}
+            if event.lower() != (tv.get("event") or "").lower():
+                t["code"] = ""           # typed a different event: code from its name
+        if not event:
+            return {"success": False, "message": "Pick a template or fill in the Event under section 6 · CUSTOM ALERT (e.g. \"Civil Emergency Message\"), save, then try again."}
+        codes = _eas_test_same_codes(settings)
+        area    = ((settings.get("eas_inject_area") or "").strip()
+                   or (describe_codes(codes) if codes != ["000000"] else "") or "this viewing area")
+        message = t["message"]
+        instruction = t["instruction"]
+        sender  = t["sender"] or "EAS Participant"
+        severity = t["severity"] or "Severe"
+        try:
+            duration_min = max(1, min(360, int(t["minutes"] or 30)))
         except Exception:
             duration_min = 30
-
-        mappings = _get_mappings()
-        silence_secs   = max(10, min(20, int(settings.get("eas_silence_secs") or 15)))
-        transcode_mode = settings.get("eas_transcode_mode") or "full"
-        overlay_style  = (settings.get("eas_overlay_style") or "easyplus").lower()
-        use_tts        = bool(settings.get("eas_tts_enabled", True))
-        generate_tones = bool(settings.get("eas_generate_tones", False))
-        try:
-            att_secs   = max(4.0, min(30.0, float(settings.get("eas_att_secs") or 8)))
-        except Exception:
-            att_secs   = 8.0
 
         from datetime import datetime, timedelta, timezone as _tz
         now_utc = datetime.now(_tz.utc)
         expires = (now_utc + timedelta(minutes=duration_min)).isoformat()
-        # Build a description that works for both overlay styles and TTS.
         desc = f"* WHAT...{event}.  * WHERE...{area}."
         if message:
             desc += f"  * DETAILS...{message}"
@@ -3269,73 +4790,26 @@ class Plugin:
             "area":        area,
             "severity":    severity,
             "effective":   now_utc.isoformat(),
+            "sent":        now_utc.isoformat(),
             "expires":     expires,
             "headline":    message or f"A {event} has been issued for {area} by {sender}.",
             "description": desc,
             "instruction": instruction,
             "sender":      sender,
-            # event_code left blank -> mapped from the event name; originator
-            # inferred from the sender; blank code list -> entire-US header.
-            "event_code":  "",
-            "originator":  "",
-            "same_codes":  [],
+            # Template code/originator when one is picked; otherwise mapped
+            # from the event name / sender.
+            "event_code":  t["code"],
+            "originator":  t["org"],
+            "same_codes":  [] if t["code"] == "NPT" else codes,
+            "station_id":  _eas_station_id_setting(settings),
         }]
+        if t["code"] == "NPT":
+            custom_alert[0]["same_codes"] = ["000000"]
 
-        fired, skipped, failed = [], [], []
-        streaming_ids = _eas_streaming_ids()
-        for channel in channels:
-            cid = str(channel.id)
-            mapping = mappings.get(cid)
-            if not mapping or (mapping.get("type") != "eas" and not mapping.get("eas_armed")):
-                skipped.append(f"{channel.name} (EAS not enabled here)")
-                continue
-            if cid not in streaming_ids:
-                skipped.append(f"{channel.name} (not currently being watched — tune to it first)")
-                continue
-            if mapping.get("eas_profile_id"):
-                skipped.append(f"{channel.name} (an alert is already active — wait for it to clear)")
-                continue
-            if not mapping.get("original_profile_id"):
-                failed.append(f"{channel.name} (incomplete mapping — re-enable EAS on this channel)")
-                continue
-            try:
-                from core.models import StreamProfile
-                orig = StreamProfile.objects.filter(id=mapping.get("original_profile_id")).first()
-                if not orig:
-                    failed.append(f"{channel.name} (original profile missing)")
-                    continue
-                _ep_font, _ep_scale = _easyplus_settings(settings)
-                _lead_in = float(settings.get("eas_lead_in_secs") or 0)
-                eas_profile, _, seq_duration = _clone_and_inject_eas(
-                    channel.id, orig, channel.name, silence_secs, transcode_mode,
-                    style=overlay_style, unique_alerts=custom_alert, use_tts=use_tts,
-                    generate_tones=generate_tones, att_secs=att_secs,
-                    easyplus_font=_ep_font, easyplus_scale=_ep_scale,
-                    lead_in_secs=_lead_in,
-                )
-                _assign_profile(channel, eas_profile)
-                _eas_write_alert(cid, custom_alert, style=overlay_style)
-                mapping["eas_profile_id"] = eas_profile.id
-                _eas_arm_restore(mapping, seq_duration, time.time())
-                mappings[cid] = mapping
-                rc = _get_redis_client()
-                if rc:
-                    try:
-                        raw_st = rc.get(_EAS_STATE_KEY)
-                        st = json.loads(raw_st) if raw_st else {}
-                        st[cid] = "__manual__"
-                        rc.setex(_EAS_STATE_KEY, 3600, json.dumps(st))
-                    except Exception:
-                        pass
-                _restart_channel_stream_async(channel, label="EAS", proactive=True)
-                fired.append(channel.name)
-                _eas_history_add(event, area, channel.name, kind="manual", severity=severity)
-            except Exception as e:
-                logger.error(f"emergencyalertarr: inject_alert failed for {channel.name}: {e}", exc_info=True)
-                failed.append(f"{channel.name} (error: {e})")
-
+        fired, notes = _eas_manual_fire(channels, custom_alert[0], settings)
+        skipped, failed = notes, []
         if fired:
-            _save_mappings(mappings)
+            _eas_history_add(event, area, fired, kind="manual", severity=severity)
         parts = []
         if fired:
             parts.append(f"Custom alert \"{event}\" fired on: {', '.join(fired)}\nThe overlay will auto-restore once the sequence finishes.")
@@ -3353,7 +4827,8 @@ class Plugin:
             return {"success": True, "message": "No EAS alerts have fired yet."}
 
         from datetime import datetime
-        kind_label = {"alert": "ALERT", "test": "TEST", "manual": "MANUAL"}
+        kind_label = {"alert": "ALERT", "test": "TEST", "manual": "MANUAL", "logged": "LOGGED",
+                      "unwatched": "NO VIEWERS"}
         lines = []
         for h in hist:
             try:
@@ -3379,6 +4854,52 @@ class Plugin:
         return {"success": True, "message": "EAS alert history cleared."}
 
 
+    def _migrate_eas(self, params):
+        """Migrate old always-on EAS profiles (ticker_profile_id) to dynamic mode."""
+        from apps.channels.models import Channel
+
+        mappings = _get_mappings()
+        old_eas = {cid: m for cid, m in mappings.items()
+                   if m and m.get("type") == "eas" and m.get("ticker_profile_id")}
+        if not old_eas:
+            return {"success": True, "message": "No old static EAS profiles found - all EAS channels are already in dynamic mode."}
+
+        migrated, failed = [], []
+        for cid, mapping in old_eas.items():
+            name = mapping.get("channel_name", f"Channel {cid}")
+            try:
+                channel = Channel.objects.filter(id=int(cid)).first()
+                if channel:
+                    _restore_profile(channel, mapping.get("original_profile_id"))
+                    _restart_channel_stream_async(channel, label="EAS")
+                _delete_cloned_profile(mapping["ticker_profile_id"])
+                mapping.pop("ticker_profile_id", None)
+                mapping.pop("eas_profile_id", None)
+                mappings[cid] = mapping
+                with _eas_lock:
+                    _eas_active.pop(cid, None)
+                migrated.append(name)
+            except Exception as e:
+                logger.error(f"emergencyalertarr: migrate EAS failed for {name}: {e}", exc_info=True)
+                failed.append(f"{name} ({e})")
+
+        _save_mappings(mappings)
+        rc = _get_redis_client()
+        if rc:
+            try:
+                rc.delete(_EAS_STATE_KEY, _EAS_OWNER_KEY)
+            except Exception:
+                pass
+
+        parts = []
+        if migrated:
+            parts.append(f"Migrated {len(migrated)} channel(s) to dynamic EAS:\n" + "\n".join(f"  - {n}" for n in migrated))
+            parts.append("Channels restored to passthrough profiles. Re-encoding only occurs when a real NWS alert fires.")
+        if failed:
+            parts.append("Failed:\n" + "\n".join(f"  - {f}" for f in failed))
+        return {"success": not failed, "message": "\n\n".join(parts) or "Nothing to do."}
+
+
     def _view_active(self, params):
         mappings = _get_mappings()
         if not mappings:
@@ -3395,6 +4916,109 @@ class Plugin:
 
     def _refresh_channels(self, params):
         return {"success": True, "message": "Channel refresh not available in EAS-only mode."}
+
+    def _stop_alerts(self, params):
+        """Panic button: end every alert that is on screen right now, put every
+        channel back on its normal profile, kick any stream still running an
+        alert profile, and mark everything currently in the feed as already
+        announced (so the queue is empty -- only alerts issued after this point
+        will play)."""
+        from apps.channels.models import Channel
+        rc = _get_redis_client()
+        for k in (_EAS_JOIN_KEY, _EAS_AIR_KEY):
+            _eas_json_del(rc, k)
+        mappings = _get_mappings()
+        ended = []
+        for cid, m in list(mappings.items()):
+            if not isinstance(m, dict):
+                continue
+            if m.get("eas_profile_id") or m.get("eas_restore_at") or m.get("eas_await_stream"):
+                _eas_do_restore(cid, m, mappings, rc)
+                ended.append(cid)
+        _save_mappings(mappings)
+
+        # Any live session still on an alert profile (ours by name or by id).
+        kicked = []
+        clone_ids = _eas_clone_ids(rc)
+        try:
+            from core.models import StreamProfile
+            clone_ids |= {str(p.id) for p in StreamProfile.objects.filter(name__startswith=PROFILE_PREFIX)}
+        except Exception:
+            pass
+        for cid in _eas_streaming_ids(rc):
+            try:
+                ch = Channel.objects.filter(id=int(cid)).first()
+            except Exception:
+                ch = None
+            if not ch:
+                continue
+            live_pid = _eas_channel_meta_profile(rc, str(ch.uuid))
+            if (live_pid and live_pid in clone_ids) or cid in ended:
+                if cid not in ended:
+                    _restart_channel_stream_async(ch, label="EAS stop")
+                kicked.append(ch.name)
+        _eas_watchdog_locked(rc)
+
+        # Empty the queue: the next poll re-seeds from the feed, so everything
+        # active now counts as announced.
+        if rc:
+            for key in (_EAS_SEEN_KEY, _EAS_CFG_FP_KEY, _EAS_REDIS_KEY, _EAS_PENDING_KEY,
+                        _EAS_NATIONAL_KEY, _EAS_MONITOR_KEY):
+                try:
+                    rc.delete(key)
+                except Exception:
+                    pass
+        _eas_json_mem.clear()
+        _eas_seen_mem["ids"] = {}
+        _eas_seen_mem["init"] = False
+        _eas_mark_alert_end(rc)
+        msg = [f"Stopped alerts on {len(ended)} channel(s)."]
+        if kicked:
+            msg.append("Restarted streams:\n" + "\n".join(f"  - {n}" for n in kicked))
+        msg.append("Alerts already in the feed are now marked as announced -- only newly "
+                   "issued alerts will play.")
+        return {"success": True, "message": "\n\n".join(msg)}
+
+    def _clean_orphans(self, params):
+        from core.models import StreamProfile
+        _eas_watchdog_locked(_get_redis_client())   # put channels back before deleting
+        mappings = _get_mappings()
+        # Collect every profile id still referenced by any mapping -- both the
+        # legacy ticker clones and the EAS clones. Use .get() since legacy/
+        # EAS-only mappings won't have every key (a missing key here previously
+        # crashed this action with KeyError: 'ticker_profile_id').
+        active_ticker_ids = set()
+        for m in mappings.values():
+            if not isinstance(m, dict):
+                continue
+            for key in ("ticker_profile_id", "eas_profile_id"):
+                pid = m.get(key)
+                if pid:
+                    active_ticker_ids.add(pid)
+
+        # Primary sweep: profiles whose name starts with PROFILE_PREFIX
+        named = list(StreamProfile.objects.filter(name__startswith=PROFILE_PREFIX))
+        orphans = [p for p in named if p.id not in active_ticker_ids]
+
+        # Secondary sweep: catch FIFO-era leftovers whose name didn't use the current
+        # prefix (different dash, older naming) but whose parameters contain emergencyalertarr_data
+        seen_ids = {p.id for p in named}
+        for p in StreamProfile.objects.all():
+            if p.id in seen_ids or p.id in active_ticker_ids:
+                continue
+            if "emergencyalertarr_data" in (p.parameters or ""):
+                orphans.append(p)
+
+        if not orphans:
+            return {"success": True, "message": "No orphaned profiles found."}
+        deleted = []
+        for profile in orphans:
+            try:
+                profile.delete()
+                deleted.append(profile.name)
+            except Exception as e:
+                logger.warning(f"emergencyalertarr: could not delete profile {profile.name}: {e}")
+        return {"success": True, "message": f"Deleted {len(deleted)} orphaned profile(s):\n" + "\n".join(f"  - {n}" for n in deleted)}
 
     def _reset_all_eas(self, params):
         """Full clean slate: restore every channel's original profile, delete ALL
@@ -3421,7 +5045,12 @@ class Plugin:
                 channel = Channel.objects.filter(id=int(cid)).first()
                 if channel:
                     orig_id = mapping.get("original_profile_id")
-                    if orig_id:
+                    if mapping.get("eas_profile_id"):
+                        # Mid-alert: put back exactly what the alert replaced.
+                        _restore_profile(channel, orig_id, slot=mapping.get("eas_slot"))
+                        _restart_channel_stream_async(channel, label="EAS reset")
+                        restored += 1
+                    elif orig_id:
                         _restore_profile(channel, orig_id)
                         _restart_channel_stream_async(channel, label="EAS reset")
                         restored += 1
@@ -3431,6 +5060,11 @@ class Plugin:
         # 2. Delete every EmergencyAlertarr-cloned StreamProfile (name-prefixed or tagged).
         deleted = 0
         try:
+            for p in StreamProfile.objects.filter(name__startswith=_EAS_PASSTHRU_PREFIX):
+                try:
+                    p.delete(); deleted += 1
+                except Exception:
+                    pass
             for p in StreamProfile.objects.filter(name__startswith=PROFILE_PREFIX):
                 try:
                     p.delete(); deleted += 1
@@ -3453,14 +5087,16 @@ class Plugin:
         if rc:
             for key in (_EAS_STATE_KEY, _EAS_GLOBAL_KEY, _EAS_ALERTS_KEY,
                         _EAS_ROTATION_KEY, _EAS_SCHED_KEY, _EAS_SCHED_LOCK,
-                        _EAS_SEEN_KEY, _EAS_OWNER_KEY):
+                        _EAS_SEEN_KEY, _EAS_OWNER_KEY, _EAS_REDIS_KEY,
+                        _EAS_CFG_FP_KEY, _EAS_LAST_END_KEY, _EAS_PENDING_KEY,
+                        _EAS_RECENT_KEY, _EAS_NATIONAL_KEY, _EAS_MONITOR_KEY):
                 try:
                     rc.delete(key)
                 except Exception:
                     pass
         # Reset the in-process seen-set too, so a reset always starts fresh
         # (the next poll re-seeds and invalidates whatever is currently active).
-        _eas_seen_mem["ids"] = set()
+        _eas_seen_mem["ids"] = {}
         _eas_seen_mem["init"] = False
 
         msg = (f"EAS reset complete.\n"
@@ -3471,75 +5107,6 @@ class Plugin:
             msg += "\n\nSome issues (non-fatal):\n" + "\n".join(f"  - {e}" for e in errors[:10])
         msg += "\n\nYou can now re-arm EAS from a clean slate."
         return {"success": True, "message": msg}
-
-    def _fetch_alerts_now(self, params):
-        """Diagnostic: poll NWS/IPAWS right now (instead of waiting for the timer),
-        show exactly what came back, and fire any genuinely new alerts on watched
-        channels using the normal seen-set logic (already-played alerts are not
-        replayed)."""
-        settings = _get_settings()
-        source = (settings.get("eas_source") or "nws").lower()
-        zones = [z.strip() for z in (settings.get("eas_zones") or "").split(",") if z.strip()]
-        severity = settings.get("eas_severity_filter") or "Moderate"
-
-        try:
-            alerts = _fetch_all_alerts(settings, zones, severity)
-        except Exception as e:
-            return {"success": False, "message": f"Fetch failed: {e}"}
-
-        rc = _get_redis_client()
-
-        # Snapshot the seen-set BEFORE firing so we can label new vs already-played.
-        seen = set(_eas_seen_mem.get("ids") or set())
-        if rc:
-            try:
-                raw = rc.get(_EAS_SEEN_KEY)
-                if raw:
-                    seen |= set(json.loads(raw if isinstance(raw, str) else raw.decode()))
-            except Exception:
-                pass
-        was_first_run = not _eas_seen_mem.get("init", False)
-
-        # Prime the cache with this exact fetch, then run the normal poll cycle so
-        # the standard logic fires only new alerts on channels that are watched.
-        if rc:
-            try:
-                rc.setex(_EAS_REDIS_KEY, _EAS_CACHE_TTL, json.dumps(alerts))
-            except Exception:
-                pass
-        try:
-            _eas_sweep()
-        except Exception as e:
-            logger.error(f"[EmergencyAlertarr] fetch-now sweep error: {e}", exc_info=True)
-
-        streaming_ids = _eas_streaming_ids(rc)
-        new_alerts = [a for a in alerts if a.get("id") not in seen]
-        lines = [
-            f"Polled {source.upper()} - {len(alerts)} active alert(s), {len(new_alerts)} new.",
-            f"Watched channels right now: {len(streaming_ids)}",
-            "",
-        ]
-        if not alerts:
-            lines.append("No active alerts for your configured area.")
-            lines.append("(Polling is working -- there's just nothing active. Use ALL codes/zones to test.)")
-        else:
-            for a in alerts:
-                src = "IPAWS" if str(a.get("id", "")).startswith("ipaws:") else "NWS"
-                area = (a.get("area") or "")
-                area = (area[:48] + "...") if len(area) > 48 else area
-                tag = "NEW" if a.get("id") not in seen else "already played"
-                lines.append(f"- [{src}] {a.get('event')} [{a.get('severity')}]"
-                             + (f" - {area}" if area else "") + f"  ({tag})")
-            lines.append("")
-            if was_first_run:
-                lines.append("First poll since (re)start: existing alerts were marked as seen and "
-                             "NOT fired (prevents a startup flood). New alerts from here on will fire.")
-            elif new_alerts:
-                lines.append(f"{len(new_alerts)} new alert(s) fired on any watched channel(s); "
-                             "already-played alerts were skipped.")
-            else:
-                lines.append("Nothing new to fire -- all active alerts were already played.")
-        return {"success": True, "message": "\n".join(lines)}
 
     def _redis_diag(self, params):
         # WAV tone file status first -- common cause of 'only one tone played'.
@@ -3554,15 +5121,10 @@ class Plugin:
                 dur = _wav_duration_secs(path)
                 flag = "✓" if sz >= 200 and dur > 0 else "✗ EMPTY/INVALID"
                 wav_lines.append(f"  {flag} {name}: {sz} bytes, {dur:.1f}s")
-        if _TTS_PIPER:
-            tts_state = f"TTS engine: Piper (natural) — {_TTS_PIPER}"
-        elif _TTS_PICO:
-            tts_state = f"TTS engine: pico2wave — {_TTS_PICO}"
-        elif _TTS_ESPEAK:
-            tts_state = f"TTS engine: espeak-ng (robotic) — {_TTS_ESPEAK}"
-        else:
-            tts_state = "TTS engine: NOT installed — alerts use silence (install Piper for a natural voice)"
-        wav_lines.append(tts_state)
+        try:
+            wav_lines.extend(tts_status(_eas_tts_opts(_get_settings())))
+        except Exception as e:
+            wav_lines.append(f"TTS status error: {e}")
         # List ChannelService methods so we can find the right proactive-restart
         # call (the channel-stop -> client-reconnect gap is what makes test
         # overlays sometimes not appear).
@@ -3579,11 +5141,37 @@ class Plugin:
         if rc is None:
             return {"success": False, "message": wav_prefix + (
                 "Redis unavailable — could not connect.\n\n"
-                "Stream-start detection is disabled. The sweep loop will poll all active "
-                "channels every 15 seconds (one bulk stellartunerlog.com fetch per cycle)."
+                "Viewer detection, the restore timer and the channel monitor need Redis; "
+                "alerts will not switch reliably until it is reachable."
             )}
 
         lines = [wav_prefix + "Redis: connected\n"]
+        try:
+            st = _get_settings()
+            mon = _eas_json_get(rc, _EAS_MONITOR_STATUS_KEY, None)
+            if _eas_chan(st, "eas_monitor_channel"):
+                if mon:
+                    lines.append(f"Channel monitor: listening to '{mon.get('channel')}' via {mon.get('url')} "
+                                 f"since {time.strftime('%H:%M', time.localtime(mon.get('since') or 0))}; "
+                                 f"{mon.get('headers', 0)} header(s) decoded"
+                                 + (f", last: {mon.get('last')}" if mon.get('last') else ""))
+                else:
+                    lines.append("Channel monitor: set, but not running yet (or no status in the last 5 min)")
+            pend = _eas_json_get(rc, _EAS_PENDING_KEY, {})
+            held = [(k, v) for k, v in pend.items() if float(v.get("hold") or 0) > 0]
+            if held:
+                lines.append("Held alerts (timed relay): " + "; ".join(
+                    f"{k[:24]} -> {max(0, (float(v['first']) + float(v['hold']) * 60 - time.time()) / 60):.1f} min left"
+                    for k, v in held))
+            nat = _eas_json_get(rc, _EAS_NATIONAL_KEY, None)
+            if nat:
+                lines.append(f"NATIONAL ALERT ACTIVE: {(nat.get('alert') or {}).get('event')}")
+            det = _eas_details_channel(_eas_fire_cfg(st))
+            if det is not None:
+                lines.append(f"Force-tune details channel: {det.name}")
+            lines.append("")
+        except Exception as e:
+            lines.append(f"(status error: {e})\n")
 
         # Scan for active stream keys (both v0.24 and v0.25 patterns)
         try:
@@ -3636,21 +5224,45 @@ class Plugin:
         except Exception as e:
             lines.append(f"ts_proxy scan error: {e}")
 
-        # Show what _redis_scan_active() currently returns
-        active = _redis_scan_active()
-        if active is None:
-            lines.append("\n_redis_scan_active(): returned None (error during scan)")
-        else:
+        # EAS engine state -- what the sweep actually sees.
+        try:
             mappings = _get_mappings()
-            mapped_ids = set(int(k) for k in mappings.keys() if k.isdigit())
-            matched = active & mapped_ids
-            lines.append(f"\n_redis_scan_active(): {len(active)} active channel ID(s) total, "
-                         f"{len(matched)} matching mapped channels")
-            if matched:
-                from apps.channels.models import Channel
-                id_to_name = dict(Channel.objects.filter(id__in=matched).values_list("id", "name"))
-                for cid in sorted(matched):
-                    lines.append(f"  - [{cid}] {id_to_name.get(cid, '?')}")
+            streaming = _eas_streaming_ids(rc)
+            armed = [c for c, m in mappings.items()
+                     if isinstance(m, dict) and (m.get("type") == "eas" or m.get("eas_armed"))]
+            lines.append(f"\nEAS engine: {len(armed)} armed channel(s), "
+                         f"{len(streaming & set(armed))} with a viewer right now")
+            now = time.time()
+            for c in armed:
+                m = mappings[c]
+                st = "idle"
+                if m.get("eas_await_stream"):
+                    st = "alert switching on (waiting for the viewer to reconnect)"
+                elif m.get("eas_restore_at"):
+                    st = f"alert on screen, restores in {max(0, float(m['eas_restore_at']) - now):.0f}s"
+                elif m.get("eas_profile_id"):
+                    st = "ORPHANED alert profile (will be cleaned up next poll)"
+                if st != "idle" or c in streaming:
+                    lines.append(f"  - [{c}] {m.get('channel_name', '?')}: {st}"
+                                 + ("  [viewer]" if c in streaming else ""))
+            raw = rc.get(_EAS_REDIS_KEY)
+            if raw:
+                data = json.loads(raw)
+                al = data.get("alerts") if isinstance(data, dict) else data
+                ok = data.get("complete", True) if isinstance(data, dict) else True
+                lines.append(f"Last poll: {len(al or [])} matching alert(s) for your area"
+                             + ("" if ok else " (PARTIAL -- a source failed)"))
+                for a in (al or [])[:10]:
+                    lines.append(f"  - {a.get('event')} [{a.get('severity')}] {(a.get('area') or '')[:60]}")
+            seen = _eas_seen_read(rc)
+            lines.append("Announced-alert memory: "
+                         + ("not initialised yet (first poll pending)" if seen is None
+                            else f"{len(seen)} key(s)"))
+            holder = rc.get(_EAS_MUTEX_KEY)
+            if holder:
+                lines.append(f"Mutex held by: {holder.decode() if isinstance(holder, bytes) else holder}")
+        except Exception as e:
+            lines.append(f"\nEAS engine status error: {e}")
 
         return {"success": True, "message": "\n".join(lines)}
 
@@ -3699,7 +5311,7 @@ class Plugin:
 
     def _resolve_channels(self, params, prefix=""):
         from apps.channels.models import Channel, ChannelGroup
-        target_type = params.get(f"{prefix}target_type", "group")
+        target_type = params.get(f"{prefix}target_type", "channel")
 
         # Build exclusion set from the exclude_groups field (applies to all target types)
         exclude_ids = set()

@@ -1,55 +1,58 @@
 {
   "name": "EmergencyAlertarr",
-  "version": "0.6.00",
+  "version": "0.9.10",
   "logo": "logo.png",
-  "description": "Emergency Alert System overlays (NWS + FEMA IPAWS) for IPTV channels",
-  "author": "sds8910",
+  "description": "Real-looking EAS alerts (NWS + FEMA IPAWS) on your IPTV channels — DASDEC, EASyPLUS, SARA and more, with SAME tones and a spoken readout",
+  "author": "EmergencyAlertarr",
   "actions": [
     {
       "id": "_header_eas",
       "type": "info",
-      "label": "-- Emergency Alert System --"
+      "label": "Alerts"
     },
     {
       "id": "enable_eas",
       "label": "Enable EAS",
       "confirm": {
-        "message": "This will arm the selected channel(s) for EAS monitoring. The channel returns to passthrough under normal conditions and switches to the full EAS overlay automatically when an NWS or IPAWS alert fires for your configured area. Continue?"
+        "message": "Arm the channels chosen in section 1? They keep playing normally and only switch to the alert screen while an alert for your area is playing."
       }
     },
     {
       "id": "disable_eas",
       "label": "Disable EAS",
       "confirm": {
-        "message": "This will restore the original stream profile and remove EAS monitoring for the selected channel(s). Continue?"
+        "message": "Stop EAS on the channels chosen in section 1 and put back their normal stream profile?"
       }
     },
     {
       "id": "test_eas",
       "label": "Test EAS Alert",
       "confirm": {
-        "message": "This will fire a test EAS alert on the selected channel(s) \u2014 header tones, attention tones, silence, then EOM tones \u2014 then auto-restore. Use this to verify your tones and overlay look correct. Continue?"
+        "message": "Play the test from section 5 on the chosen channels now?"
       }
     },
     {
       "id": "inject_alert",
       "label": "Inject Custom Alert",
       "confirm": {
-        "message": "This will broadcast the custom alert defined in the Custom Alert Injection settings on the selected EAS channel(s), with the full overlay, tones, and (if enabled) spoken readout. Continue?"
+        "message": "Send the custom alert from section 6 to the chosen channels now?"
+      }
+    },
+    {
+      "id": "stop_alerts",
+      "label": "Stop All Alerts Now",
+      "confirm": {
+        "message": "End every alert on screen right now, put all channels back to normal and skip the alerts already in the feed?"
       }
     },
     {
       "id": "_header_manage",
       "type": "info",
-      "label": "-- Manage --"
+      "label": "History"
     },
     {
       "id": "view_active",
-      "label": "View Active Alerts"
-    },
-    {
-      "id": "fetch_alerts",
-      "label": "Fetch Alerts Now"
+      "label": "View Armed Channels"
     },
     {
       "id": "view_history",
@@ -59,32 +62,37 @@
       "id": "clear_history",
       "label": "Clear Alert History",
       "confirm": {
-        "message": "This will permanently erase the recorded EAS alert history. Continue?"
+        "message": "Erase the alert history?"
+      }
+    },
+    {
+      "id": "_header_maint",
+      "type": "info",
+      "label": "Troubleshooting"
+    },
+    {
+      "id": "redis_diag",
+      "label": "Diagnostics"
+    },
+    {
+      "id": "reload_poller",
+      "label": "Restart Alert Checking",
+      "confirm": {
+        "message": "Restart the background alert checker? Checking resumes within 15 seconds."
+      }
+    },
+    {
+      "id": "clean_orphans",
+      "label": "Clean Up Leftover Alert Profiles",
+      "confirm": {
+        "message": "Delete EmergencyAlertarr alert profiles that no channel is using?"
       }
     },
     {
       "id": "reset_all_eas",
-      "label": "Reset All EAS (Wipe Mappings)",
+      "label": "Reset Everything",
       "confirm": {
-        "message": "This will UNARM every channel, restore all original profiles, delete all EmergencyAlertarr cloned profiles, and erase all EAS mappings for a full clean slate. Use this if old armings persisted after reinstalling. Continue?"
-      }
-    },
-    {
-      "id": "redis_diag",
-      "label": "Redis Diagnostics"
-    },
-    {
-      "id": "reload_poller",
-      "label": "Reload Poller",
-      "confirm": {
-        "message": "This will restart the background polling thread. EAS monitoring will resume within 15 seconds. Continue?"
-      }
-    },
-    {
-      "id": "restart_dispatcharr",
-      "label": "Restart Dispatcharr",
-      "confirm": {
-        "message": "This will send a graceful restart signal to Dispatcharr. The page will go offline briefly \u2014 refresh in about 15 seconds. Continue?"
+        "message": "Disarm every channel, restore all normal profiles, delete all EmergencyAlertarr profiles and forget all EAS settings for channels. Continue?"
       }
     }
   ]
